@@ -1,0 +1,195 @@
+{% extends "base.html" %}
+{% block title %}Paper2MD — new task{% endblock %}
+
+{% block content %}
+<section class="panel">
+  <h2>New task</h2>
+  <p class="hint">
+    Pick every photo of the same exam paper. The upload order is the page order —
+    the first picture you select becomes page 1.
+    Accepted: JPG, PNG, WebP, BMP, TIFF · up to {{ max_upload_mb }} MB each.
+  </p>
+
+  <div class="row" style="margin-bottom:12px">
+    <input type="text" id="title" placeholder="Title (optional), e.g. Math midterm 2024"
+           style="flex:1;min-width:260px" maxlength="80">
+  </div>
+
+  <label class="dropzone" id="dropzone" for="fileInput">
+    <strong>Click to choose photos, or drop them here</strong>
+    You can select many at once · OCR runs {{ ocr_workers }} page at a time
+  </label>
+  <input type="file" id="fileInput" accept="image/*" multiple hidden>
+
+  <div class="thumbs" id="thumbs"></div>
+
+  <div class="row" style="margin-top:16px">
+    <button class="primary" id="startBtn" disabled>Upload &amp; start OCR</button>
+    <button id="clearBtn" disabled>Clear</button>
+    <span class="muted" id="selectionInfo"></span>
+  </div>
+</section>
+
+<section class="panel">
+  <h2>Tasks</h2>
+  {% if tasks %}
+  <table>
+    <thead>
+      <tr>
+        <th>Title</th><th>Status</th><th>Pages</th><th>Figures</th>
+        <th>Created</th><th></th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for task in tasks %}
+      <tr>
+        <td>
+          <a href="/tasks/{{ task.id }}">
+            {{ task.title or task.id }}
+          </a>
+          {% if task.title %}<div class="mono muted">{{ task.id }}</div>{% endif %}
+        </td>
+        <td><span class="badge {{ task.status }}">{{ task.status }}</span></td>
+        <td>{{ task.done_count }} / {{ task.page_count }}</td>
+        <td>{{ task.image_count }}</td>
+        <td class="muted">{{ task.created_at | ts }}</td>
+        <td style="text-align:right;white-space:nowrap">
+          {% if task.status == 'done' or task.status == 'partial' %}
+          <a class="btn" href="/tasks/{{ task.id }}/edit?page=0">Review figures</a>
+          {% endif %}
+          <a class="btn" href="/tasks/{{ task.id }}/download">.md</a>
+          <button class="danger" data-delete="{{ task.id }}" title="Delete">✕</button>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="empty">No tasks yet — upload your first paper above.</p>
+  {% endif %}
+</section>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const MAX_BATCH = 25;
+
+let selected = [];
+const dropzone = document.getElementById("dropzone");
+const fileInput = document.getElementById("fileInput");
+const thumbs = document.getElementById("thumbs");
+const startBtn = document.getElementById("startBtn");
+const clearBtn = document.getElementById("clearBtn");
+const selectionInfo = document.getElementById("selectionInfo");
+const titleInput = document.getElementById("title");
+
+function renderThumbs() {
+  thumbs.innerHTML = "";
+  selected.forEach((file, index) => {
+    const card = document.createElement("div");
+    card.className = "thumb";
+    const image = document.createElement("img");
+    image.src = URL.createObjectURL(file);
+    image.onload = () => URL.revokeObjectURL(image.src);
+    image.alt = file.name;
+    const number = document.createElement("span");
+    number.className = "n";
+    number.textContent = String(index + 1);
+    const remove = document.createElement("button");
+    remove.className = "x";
+    remove.textContent = "×";
+    remove.title = "Remove";
+    remove.onclick = (event) => {
+      event.preventDefault();
+      selected.splice(index, 1);
+      renderThumbs();
+    };
+    card.append(image, number, remove);
+    thumbs.appendChild(card);
+  });
+
+  const totalMb = selected.reduce((sum, file) => sum + file.size, 0) / (1024 * 1024);
+  selectionInfo.textContent = selected.length
+    ? `${selected.length} page(s), ${totalMb.toFixed(1)} MB total`
+    : "";
+  startBtn.disabled = selected.length === 0;
+  clearBtn.disabled = selected.length === 0;
+}
+
+function addFiles(fileList) {
+  for (const file of fileList) {
+    if (file.type.startsWith("image/")) selected.push(file);
+  }
+  renderThumbs();
+}
+
+dropzone.addEventListener("click", () => fileInput.click());
+fileInput.addEventListener("change", () => {
+  addFiles(fileInput.files);
+  fileInput.value = "";
+});
+
+["dragenter", "dragover"].forEach((name) =>
+  dropzone.addEventListener(name, (event) => {
+    event.preventDefault();
+    dropzone.classList.add("over");
+  })
+);
+["dragleave", "drop"].forEach((name) =>
+  dropzone.addEventListener(name, (event) => {
+    event.preventDefault();
+    dropzone.classList.remove("over");
+  })
+);
+dropzone.addEventListener("drop", (event) => addFiles(event.dataTransfer.files));
+
+clearBtn.addEventListener("click", () => {
+  selected = [];
+  renderThumbs();
+});
+
+startBtn.addEventListener("click", async () => {
+  if (!selected.length) return;
+  startBtn.disabled = true;
+  clearBtn.disabled = true;
+  startBtn.textContent = "Creating task…";
+  try {
+    const created = await api("/api/tasks", jsonRequest("POST", { title: titleInput.value }));
+    const taskId = created.task_id;
+
+    let uploaded = 0;
+    for (let start = 0; start < selected.length; start += MAX_BATCH) {
+      const batch = selected.slice(start, start + MAX_BATCH);
+      const form = new FormData();
+      batch.forEach((file) => form.append("files", file, file.name));
+      startBtn.textContent = `Uploading ${uploaded + batch.length} / ${selected.length}…`;
+      const result = await api(`/api/tasks/${taskId}/pages`, { method: "POST", body: form });
+      uploaded += result.accepted.length;
+      if (result.skipped.length) {
+        toast(`${result.skipped.length} file(s) skipped: ${result.skipped[0].reason}`, true);
+      }
+    }
+    window.location.href = `/tasks/${taskId}`;
+  } catch (error) {
+    toast(error.message, true);
+    startBtn.disabled = false;
+    clearBtn.disabled = false;
+    startBtn.textContent = "Upload & start OCR";
+  }
+});
+
+document.querySelectorAll("[data-delete]").forEach((button) => {
+  button.addEventListener("click", async () => {
+    const id = button.dataset.delete;
+    if (!confirm(`Delete task ${id} and its uploaded pages?`)) return;
+    try {
+      await api(`/api/tasks/${id}`, { method: "DELETE" });
+      button.closest("tr").remove();
+      toast("Task deleted");
+    } catch (error) {
+      toast(error.message, true);
+    }
+  });
+});
+</script>
+{% endblock %}

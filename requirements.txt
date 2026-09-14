@@ -1,0 +1,12 @@
+# Paper2MD runtime dependencies.
+#
+# PaddlePaddle and PaddleOCR are installed separately because the CPU wheel has
+# to come from Paddle's own index — see README.md and install.sh.
+
+fastapi>=0.110
+uvicorn[standard]>=0.27
+python-multipart>=0.0.9
+jinja2>=3.1
+python-dotenv>=1.0
+pillow>=10.0
+requests>=2.31

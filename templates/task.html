@@ -1,0 +1,181 @@
+{% extends "base.html" %}
+{% block title %}{{ task.title or task.id }} — Paper2MD{% endblock %}
+
+{% block nav %}
+  <a href="/tasks/{{ task.id }}/download">Download .md</a>
+{% endblock %}
+
+{% block content %}
+<section class="panel">
+  <div class="row">
+    <h2 style="margin:0;flex:1">
+      {{ task.title or "Untitled task" }}
+      <span class="badge {{ task.status }}" id="taskStatus">{{ task.status }}</span>
+    </h2>
+    {% if task.status in ('done', 'partial') %}
+    <a class="btn primary" href="/tasks/{{ task.id }}/edit?page=0">Review figures →</a>
+    {% endif %}
+    <a class="btn" href="/tasks/{{ task.id }}/download">Download .md</a>
+    <button class="danger" id="deleteTask">Delete</button>
+  </div>
+  <p class="hint" style="margin-top:8px">
+    Task <span class="mono">{{ task.id }}</span> ·
+    <span id="progressText">{{ task.pages | selectattr('status', 'equalto', 'done') | list | length }} / {{ task.pages | length }} pages finished</span>
+    · <span id="queueText"></span>
+  </p>
+
+  <div class="row" style="margin-top:6px">
+    <label class="btn" for="addPages">＋ Add more pages</label>
+    <input type="file" id="addPages" accept="image/*" multiple hidden>
+    <span class="muted" id="addInfo"></span>
+  </div>
+</section>
+
+<section class="panel">
+  <h2>Pages</h2>
+  <p class="hint">Each photo is processed in upload order. Figures found on a page appear in the review screen.</p>
+  <div class="cards" id="cards">
+    {% for page in task.pages %}
+    <div class="card" data-page="{{ page.page_index }}">
+      <a class="shot" href="/tasks/{{ task.id }}/pages/{{ page.page_index }}/raw" target="_blank">
+        <img src="/tasks/{{ task.id }}/pages/{{ page.page_index }}/raw" alt="page {{ page.page_index + 1 }}" loading="lazy">
+      </a>
+      <div class="body">
+        <div class="row" style="justify-content:space-between">
+          <strong>Page {{ page.page_index + 1 }}</strong>
+          <span class="badge {{ page.status }}" data-role="status">{{ page.status }}</span>
+        </div>
+        <div class="meta" data-role="meta">
+          {% if page.status == 'done' %}{{ page.image_count }} figure(s){% else %}waiting{% endif %}
+        </div>
+        <div class="err" data-role="error">{{ page.error or "" }}</div>
+        <div class="row" data-role="actions"></div>
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+  {% if not task.pages %}
+  <p class="empty">No pages uploaded for this task.</p>
+  {% endif %}
+</section>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const TASK_ID = {{ task.id | tojson }};
+const TERMINAL = ["done", "partial", "failed"];
+let pollTimer = null;
+
+function renderActions(card, page) {
+  const actions = card.querySelector('[data-role="actions"]');
+  actions.innerHTML = "";
+  if (page.status === "done") {
+    const link = document.createElement("a");
+    link.className = "btn";
+    link.href = `/tasks/${TASK_ID}/edit?page=${page.page_index}`;
+    link.textContent = "Review figures";
+    actions.appendChild(link);
+  }
+  if (page.status === "failed") {
+    const retry = document.createElement("button");
+    retry.textContent = "Retry";
+    retry.onclick = async () => {
+      retry.disabled = true;
+      retry.textContent = "Retrying…";
+      try {
+        await api(`/api/tasks/${TASK_ID}/pages/${page.page_index}/retry`, { method: "POST" });
+        toast(`Page ${page.page_index + 1} queued again`);
+        refresh();
+      } catch (error) {
+        toast(error.message, true);
+        retry.disabled = false;
+        retry.textContent = "Retry";
+      }
+    };
+    actions.appendChild(retry);
+  }
+}
+
+function applyPage(card, page) {
+  const status = card.querySelector('[data-role="status"]');
+  status.textContent = page.status;
+  status.className = `badge ${badgeClass(page.status)}`;
+
+  const meta = card.querySelector('[data-role="meta"]');
+  if (page.status === "done") meta.textContent = `${page.image_count} figure(s)`;
+  else if (page.status === "processing") meta.innerHTML = '<span class="spinner"></span> running OCR…';
+  else if (page.status === "queued") meta.textContent = "queued";
+  else meta.textContent = "—";
+
+  card.querySelector('[data-role="error"]').textContent = page.error || "";
+  renderActions(card, page);
+}
+
+async function refresh() {
+  let data;
+  try {
+    data = await api(`/api/tasks/${TASK_ID}`);
+  } catch (error) {
+    console.warn(error);
+    return;
+  }
+
+  const status = document.getElementById("taskStatus");
+  status.textContent = data.status;
+  status.className = `badge ${badgeClass(data.status)}`;
+
+  const done = data.pages.filter((page) => page.status === "done").length;
+  document.getElementById("progressText").textContent =
+    `${done} / ${data.pages.length} pages finished`;
+  document.getElementById("queueText").textContent =
+    data.queue ? `${data.queue} page(s) in the queue` : "queue empty";
+
+  for (const page of data.pages) {
+    let card = document.querySelector(`.card[data-page="${page.page_index}"]`);
+    if (!card) {
+      // A page added while we were polling — reload once to pick up its thumbnail.
+      window.location.reload();
+      return;
+    }
+    applyPage(card, page);
+  }
+
+  const finished = data.pages.length > 0 &&
+    data.pages.every((page) => TERMINAL.includes(page.status));
+  if (finished && pollTimer) {
+    clearInterval(pollTimer);
+    pollTimer = null;
+  }
+}
+
+document.getElementById("addPages").addEventListener("change", async (event) => {
+  const files = Array.from(event.target.files || []);
+  if (!files.length) return;
+  const info = document.getElementById("addInfo");
+  info.textContent = `Uploading ${files.length} page(s)…`;
+  try {
+    const form = new FormData();
+    files.forEach((file) => form.append("files", file, file.name));
+    const result = await api(`/api/tasks/${TASK_ID}/pages`, { method: "POST", body: form });
+    info.textContent = `${result.accepted.length} page(s) queued`;
+    window.location.reload();
+  } catch (error) {
+    info.textContent = "";
+    toast(error.message, true);
+  }
+});
+
+document.getElementById("deleteTask").addEventListener("click", async () => {
+  if (!confirm("Delete this task and all its uploaded pages?")) return;
+  try {
+    await api(`/api/tasks/${TASK_ID}`, { method: "DELETE" });
+    window.location.href = "/";
+  } catch (error) {
+    toast(error.message, true);
+  }
+});
+
+pollTimer = setInterval(refresh, 2500);
+refresh();
+</script>
+{% endblock %}

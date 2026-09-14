@@ -1,0 +1,309 @@
+{% extends "base.html" %}
+{% block title %}Review — {{ task.title or task.id }}{% endblock %}
+{% block main_class %}wide{% endblock %}
+
+{% block nav %}
+  <a href="/tasks/{{ task.id }}">Task status</a>
+{% endblock %}
+
+{% block content %}
+<div class="editor-toolbar">
+  <strong>{{ task.title or task.id }}</strong>
+  <select id="pageSelect" title="Jump to another page">
+    {% for page in task.pages %}
+    <option value="{{ page.page_index }}" {% if page.page_index == page_index %}selected{% endif %}>
+      Page {{ page.page_index + 1 }}{% if page.status != 'done' %} ({{ page.status }}){% endif %}
+    </option>
+    {% endfor %}
+  </select>
+
+  <button id="autoNextBtn" title="Number the figures from top to bottom, starting at a question you choose">
+    Auto-fill: next questions
+  </button>
+  <button id="autoMatchBtn" title="Match the figures, top to bottom, to the question numbers found on this page">
+    Auto-fill: match detected
+  </button>
+  <button id="clearBtn">Clear numbers</button>
+
+  <span class="spacer"></span>
+  <span class="muted" id="saveState">saved</span>
+  <button id="hostBtn" title="Upload every figure to the image host and show the final markdown">
+    Upload figures ({{ image_host }})
+  </button>
+  <a class="btn" href="/tasks/{{ task.id }}/pages/{{ page_index }}/download">Page .md</a>
+  <a class="btn primary" href="/tasks/{{ task.id }}/download">Whole paper .md</a>
+</div>
+
+<div class="editor">
+  <section>
+    <div class="panel" style="padding:0;overflow:hidden">
+      <div style="display:flex;align-items:center;gap:10px;padding:10px 14px;border-bottom:1px solid var(--line)">
+        <strong style="font-size:14px" id="previewTitle">Preview</strong>
+        <span class="muted" id="previewNote">figures are labelled once you set their question number</span>
+        <span class="spacer" style="flex:1"></span>
+        <a class="muted" target="_blank" href="/tasks/{{ task.id }}/pages/{{ page_index }}/raw">view original photo ↗</a>
+      </div>
+      <div class="preview" id="preview"></div>
+    </div>
+  </section>
+
+  <aside>
+    <div class="panel">
+      <h2>Figures on this page</h2>
+      <p class="hint">
+        Type the question number each figure belongs to. Changes save automatically
+        and the figure moves under that question in the preview.
+      </p>
+      <div class="questions" id="questionChips"></div>
+      <div class="figures" id="figures" style="margin-top:12px"></div>
+    </div>
+  </aside>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const TASK_ID = {{ task.id | tojson }};
+const PAGE_INDEX = {{ page_index | tojson }};
+
+const previewEl = document.getElementById("preview");
+const figuresEl = document.getElementById("figures");
+const chipsEl = document.getElementById("questionChips");
+const saveState = document.getElementById("saveState");
+
+let figureNames = [];     // filenames, in document order
+let detectedQuestions = [];
+let saveTimer = null;
+
+/* ---------------------------------------------------------------- render */
+
+function decoratePreview() {
+  previewEl.querySelectorAll("em").forEach((element) => {
+    if (/^\[Q\d+\s*附图\]$/.test(element.textContent.trim())) {
+      element.classList.add("q-label");
+    }
+  });
+}
+
+function showMarkdown(markdown) {
+  renderMarkdown(previewEl, markdown);
+  decoratePreview();
+}
+
+function figureCard(name, index) {
+  const card = document.createElement("div");
+  card.className = "figure";
+  card.dataset.name = name;
+
+  const image = document.createElement("img");
+  image.src = `/tasks/${TASK_ID}/images/${encodeURIComponent(name)}`;
+  image.alt = name;
+  image.loading = "lazy";
+
+  const body = document.createElement("div");
+  const filename = document.createElement("div");
+  filename.className = "fname";
+  filename.textContent = name;
+
+  const row = document.createElement("div");
+  row.className = "qrow";
+  const label = document.createElement("span");
+  label.className = "seq";
+  label.textContent = `#${index + 1} · question`;
+  const input = document.createElement("input");
+  input.type = "text";
+  input.inputMode = "numeric";
+  input.placeholder = "e.g. 13";
+  input.dataset.role = "q";
+  input.addEventListener("input", scheduleSave);
+  input.addEventListener("blur", () => saveMapping({ immediate: true }));
+
+  row.append(label, input);
+  body.append(filename, row);
+  card.append(image, body);
+  return card;
+}
+
+function renderFigures(names, mapping) {
+  figuresEl.innerHTML = "";
+  if (!names.length) {
+    figuresEl.innerHTML = '<p class="empty">No figures found on this page.</p>';
+    return;
+  }
+  names.forEach((name, index) => {
+    const card = figureCard(name, index);
+    card.querySelector('[data-role="q"]').value = mapping[name] || "";
+    figuresEl.appendChild(card);
+  });
+  markAssigned();
+}
+
+function renderChips() {
+  chipsEl.innerHTML = "";
+  if (!detectedQuestions.length) {
+    chipsEl.innerHTML = '<span class="muted" style="font-size:12px">' +
+      'No numbered questions detected on this page.</span>';
+    return;
+  }
+  const used = new Set(currentMapping().values());
+  detectedQuestions.forEach((number) => {
+    const chip = document.createElement("span");
+    chip.className = "chip" + (used.has(number) ? " used" : "");
+    chip.textContent = number;
+    chipsEl.appendChild(chip);
+  });
+}
+
+function markAssigned() {
+  const mapping = currentMapping();
+  figuresEl.querySelectorAll(".figure").forEach((card) => {
+    card.classList.toggle("assigned", !!mapping.get(card.dataset.name));
+  });
+}
+
+/* ---------------------------------------------------------------- mapping */
+
+function currentMapping() {
+  const mapping = new Map();
+  figuresEl.querySelectorAll(".figure").forEach((card) => {
+    const value = card.querySelector('[data-role="q"]').value.trim();
+    const question = value.replace(/^[Qq]/, "").replace(/[.、,．)]$/, "");
+    if (question && /^\d+$/.test(question)) mapping.set(card.dataset.name, String(Number(question)));
+  });
+  return mapping;
+}
+
+function scheduleSave() {
+  markAssigned();
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => saveMapping(), 700);
+}
+
+async function saveMapping({ immediate = false } = {}) {
+  clearTimeout(saveTimer);
+  if (immediate) { /* called from blur */ }
+  const mapping = Object.fromEntries(currentMapping());
+  saveState.textContent = "saving…";
+  try {
+    const result = await api(
+      `/api/tasks/${TASK_ID}/pages/${PAGE_INDEX}/mapping`,
+      jsonRequest("PUT", mapping)
+    );
+    showMarkdown(result.markdown);
+    saveState.textContent = "saved";
+    renderChips();
+    markAssigned();
+  } catch (error) {
+    saveState.textContent = "not saved";
+    toast(error.message, true);
+  }
+}
+
+/* ------------------------------------------------------------- auto-fill */
+
+function boxFromName(name) {
+  const match = name.match(/box_(\d+)_(\d+)_(\d+)_(\d+)/);
+  if (!match) return null;
+  return { y1: +match[1], x1: +match[2], y2: +match[3], x2: +match[4] };
+}
+
+function setMapping(map) {
+  figuresEl.querySelectorAll(".figure").forEach((card) => {
+    card.querySelector('[data-role="q"]').value = map.get(card.dataset.name) || "";
+  });
+  saveMapping({ immediate: true });
+}
+
+function autoFillSequential() {
+  if (!figureNames.length) { toast("No figures on this page", true); return; }
+
+  // Prefer the model's own coordinates so "top to bottom" really is top to bottom.
+  const positioned = figureNames.map((name, index) => ({ name, index, box: boxFromName(name) }));
+  const hasBoxes = positioned.every((item) => item.box);
+  positioned.sort((a, b) =>
+    hasBoxes ? (a.box.y1 - b.box.y1 || a.box.x1 - b.box.x1) : a.index - b.index
+  );
+
+  const suggested = detectedQuestions[0] || "1";
+  const answer = prompt(
+    `Number the ${positioned.length} figure(s) top to bottom, starting at question:`,
+    suggested
+  );
+  if (answer === null) return;
+  const start = Number(String(answer).replace(/^[Qq]/, ""));
+  if (!Number.isInteger(start)) { toast("Please enter a whole number", true); return; }
+
+  const map = new Map();
+  positioned.forEach((item, offset) => map.set(item.name, String(start + offset)));
+  setMapping(map);
+  toast(`Assigned questions ${start}–${start + positioned.length - 1}`);
+}
+
+function autoFillMatchDetected() {
+  if (!figureNames.length) { toast("No figures on this page", true); return; }
+  if (!detectedQuestions.length) {
+    toast("No question numbers were detected on this page", true);
+    return;
+  }
+  const map = new Map();
+  figureNames.forEach((name, index) => {
+    const question = detectedQuestions[index];
+    if (question) map.set(name, question);
+  });
+  setMapping(map);
+  toast(`Matched ${map.size} figure(s) to the detected questions`);
+}
+
+/* ------------------------------------------------------------------ init */
+
+async function loadPage() {
+  const data = await api(`/api/tasks/${TASK_ID}/pages/${PAGE_INDEX}`);
+  figureNames = data.figures || [];
+  detectedQuestions = data.questions || [];
+  showMarkdown(data.labelled_markdown || data.markdown || "");
+  renderFigures(figureNames, data.mapping || {});
+  renderChips();
+}
+
+document.getElementById("pageSelect").addEventListener("change", (event) => {
+  window.location.href = `/tasks/${TASK_ID}/edit?page=${event.target.value}`;
+});
+
+document.getElementById("autoNextBtn").addEventListener("click", autoFillSequential);
+document.getElementById("autoMatchBtn").addEventListener("click", autoFillMatchDetected);
+document.getElementById("clearBtn").addEventListener("click", () => setMapping(new Map()));
+
+document.getElementById("hostBtn").addEventListener("click", async (event) => {
+  const button = event.currentTarget;
+  const original = button.textContent;
+  button.disabled = true;
+  button.textContent = "Uploading figures…";
+  try {
+    await saveMapping({ immediate: true });
+    const result = await api(`/api/tasks/${TASK_ID}/host-images`, { method: "POST" });
+    showMarkdown(result.markdown);
+    const count = Object.keys(result.urls || {}).length;
+    document.getElementById("previewTitle").textContent = "Final markdown";
+    document.getElementById("previewNote").textContent = count
+      ? `${count} figure(s) hosted · this is exactly what the .md contains`
+      : "figures inlined into the markdown";
+    toast(count ? `Uploaded ${count} figure(s)` : "Figures inlined");
+  } catch (error) {
+    toast(error.message, true);
+  } finally {
+    button.disabled = false;
+    button.textContent = original;
+  }
+});
+
+loadPage().catch((error) => toast(error.message, true));
+
+// Warn before losing unsaved edits.
+window.addEventListener("beforeunload", (event) => {
+  if (saveState.textContent === "saving…") {
+    event.preventDefault();
+    event.returnValue = "";
+  }
+});
+</script>
+{% endblock %}
