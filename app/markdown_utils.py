@@ -31,7 +31,17 @@ _MD_IMG_SRC_RE = re.compile(r"(!\[[^\]]*\]\()([^)]+)(\))")
 # A bare image filename anywhere in the text.
 _FILENAME_RE = re.compile(rf"""([^/\\"'\s()]+\.(?:{_EXT_ALT}))""", re.IGNORECASE)
 # The label we insert in front of a figure.
-_LABEL_RE = re.compile(r"\*\[Q\d+\s*附图\]\*\s*\n*")
+# The old form was a standalone line:  *[Q13 附图]*
+# The current form carries the label in the image's alt text:  ![Q13 附图](url)
+# and numbers them when a question has more than one figure.
+_LABEL_LINE_RE = re.compile(r"^[ \t]*\*\[Q\d+\s*附图\d*\]\*[ \t]*\n?", re.MULTILINE)
+ALT_QUESTION_RE = re.compile(r"!\[\s*Q(\d+)\s*附图", re.IGNORECASE)
+_ALT_LABEL_RE = re.compile(r"!\[\s*Q\d+\s*附图\d*\s*\]\(", re.IGNORECASE)
+# A standalone label immediately followed by the figure it belongs to.
+_BAKED_LABEL_RE = re.compile(
+    r"\*\[Q(\d+)\s*附图\d*\]\*\s*\n*\s*(<img\s[^>]*?>|!\[[^\]]*\]\([^)]*\))",
+    re.IGNORECASE,
+)
 # "13." / "13、" / "13．" / "13)" / "13," starting a line.
 _QUESTION_RE = re.compile(r"^[ \t]*(\d{1,2})[ \t]*[.、,．)]", re.MULTILINE)
 _REMOTE_REF_RE = re.compile(r"^(?:https?:|data:)", re.IGNORECASE)
@@ -157,8 +167,25 @@ def normalize_question(value: object) -> str:
 
 
 def strip_labels(md: str) -> str:
-    """Remove every ``*[Q<N> 附图]*`` label."""
-    return _LABEL_RE.sub("", md)
+    """Remove every figure label, leaving the image itself in place.
+
+    Handles both the old standalone ``*[Q13 附图]*`` line and the current form
+    where the label sits in the image's alt text (``![Q13 附图](url)`` becomes
+    ``![](url)``). Stripping is what lets a mapping be re-applied cleanly.
+    """
+    md = _LABEL_LINE_RE.sub("", md)
+    return _ALT_LABEL_RE.sub("![](", md)
+
+
+def image_ref_url(text: str) -> str:
+    """Pull the URL/path out of an ``<img>`` tag or a markdown image."""
+    match = _IMG_SRC_RE.search(text) or _MD_SRC_RE.search(text)
+    return match.group(1).strip() if match else ""
+
+
+def figure_label(question: str, index: int, total: int) -> str:
+    """``Q13 附图`` for a lone figure, ``Q13 附图1`` / ``附图2`` when several."""
+    return f"Q{question} 附图{index}" if total > 1 else f"Q{question} 附图"
 
 
 def _remove_images(md: str, only: set[str]) -> str:
@@ -178,22 +205,75 @@ def _remove_images(md: str, only: set[str]) -> str:
 
 def _label_in_place(md: str, mapping: dict[str, str]) -> str:
     """Tag figures without moving them (used when no question headers exist)."""
+    totals: dict[str, int] = {}
+    for question in mapping.values():
+        totals[question] = totals.get(question, 0) + 1
+    seen: dict[str, int] = {}
 
     def repl(match: re.Match[str]) -> str:
         text = match.group(0)
-        src = _IMG_SRC_RE.search(text) or _MD_SRC_RE.search(text)
-        if not src:
+        url = image_ref_url(text)
+        if not url:
             return text
-        question = mapping.get(Path(src.group(1)).name)
+        question = mapping.get(Path(url).name)
         if not question:
             return text
-        return f"*[Q{question} 附图]*\n\n{text}"
+        seen[question] = seen.get(question, 0) + 1
+        label = figure_label(question, seen[question], totals.get(question, 1))
+        return f"![{label}]({url})"
 
     return _ANY_IMG_RE.sub(repl, md)
 
 
 # Mapping values that mean "delete this figure" rather than "put it under Qn".
 DROP_VALUES = {"drop", "remove", "delete", "hide", "x", "-", "✕", "✗", "❌"}
+
+
+def extract_baked_labels(md: str) -> tuple[str, dict[str, str]]:
+    """Pull figure labels that an engine baked into stored markdown back out.
+
+    Older runs wrote the label into the page text instead of storing it as a
+    mapping. This recovers ``{filename: question}`` so the label can be applied
+    at render time instead, and returns the markdown with the labels removed.
+    Handles both the standalone ``*[Q13 附图]*`` line and the alt-text form.
+    """
+    mapping: dict[str, str] = {}
+
+    for match in _BAKED_LABEL_RE.finditer(md):
+        url = image_ref_url(match.group(2))
+        if url:
+            mapping[Path(url).name] = match.group(1)
+
+    for match in _ANY_IMG_RE.finditer(md):
+        alt = ALT_QUESTION_RE.match(match.group(0))
+        if alt:
+            url = image_ref_url(match.group(0))
+            if url:
+                mapping[Path(url).name] = alt.group(1)
+
+    return strip_labels(md), mapping
+
+
+def _figure_block(names: list[str], question: str, texts: dict[str, str]) -> str:
+    """The markdown for every figure belonging to one question.
+
+    Emitted as standard markdown images whose alt text carries the label, so the
+    figure and its question stay together in any markdown renderer:
+
+        ![Q17 附图](https://.../a.jpg)
+        ![Q17 附图2](https://.../b.jpg)     <- second figure of the same question
+    """
+    total = len(names)
+    if not total:
+        return ""
+    out = ["\n\n"]
+    for index, name in enumerate(names, start=1):
+        url = image_ref_url(texts[name])
+        if not url:
+            continue
+        out.append(f"![{figure_label(question, index, total)}]({url})\n")
+    out.append("\n")
+    return "".join(out)
 
 
 def apply_labels_mapping(md: str, mapping: dict[str, str]) -> str:
@@ -250,15 +330,13 @@ def apply_labels_mapping(md: str, mapping: dict[str, str]) -> str:
     for index, (start, number) in enumerate(headers):
         end = headers[index + 1][0] if index + 1 < len(headers) else len(body)
         parts.append(body[cursor:end])
-        for name in grouped.pop(number, []):
-            parts.append(f"\n\n*[Q{number} 附图]*\n\n{texts[name]}\n")
+        parts.append(_figure_block(grouped.pop(number, []), number, texts))
         cursor = end
     parts.append(body[cursor:])
 
     # Figures whose question number never showed up in the text.
     for number in sorted(grouped, key=int):
-        for name in grouped[number]:
-            parts.append(f"\n\n*[Q{number} 附图]*\n\n{texts[name]}\n")
+        parts.append(_figure_block(grouped[number], number, texts))
 
     return re.sub(r"\n{4,}", "\n\n\n", "".join(parts))
 

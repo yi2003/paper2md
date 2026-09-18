@@ -26,7 +26,7 @@ from typing import Any, Callable
 import requests
 
 from . import config
-from .markdown_utils import normalize_question
+from .markdown_utils import ALT_QUESTION_RE, normalize_question
 
 # Any figure reference, HTML or markdown, local path or remote URL.
 _ANY_IMG_RE = re.compile(r"<img\s[^>]*?>|!\[[^\]]*\]\([^)]*\)", re.IGNORECASE)
@@ -99,12 +99,20 @@ def protect_figures(markdown: str) -> tuple[str, dict[str, dict[str, str]]]:
         start, end = match.start(), match.end()
         label = ""
 
-        label_match = _LABEL_BEFORE_RE.search(markdown[:start])
-        if label_match:
-            start = label_match.start()
-            label = label_match.group(0).strip()
+        alt = ALT_QUESTION_RE.match(ref)
+        if alt:
+            # Current form: the question is in the image's alt text and the
+            # label is part of the image syntax, so restoring the ref as-is
+            # reproduces it exactly.
+            question = alt.group(1)
+        else:
+            # Older form: a standalone "*[Q13 附图]*" line just before the tag.
+            label_match = _LABEL_BEFORE_RE.search(markdown[:start])
+            if label_match:
+                start = label_match.start()
+                label = label_match.group(0).strip()
+            question = label_match.group(1) if label_match else None
 
-        question = label_match.group(1) if label_match else None
         marker = f"[[FIG{index}-Q{question}]]" if question else f"[[FIG{index}]]"
         regions.append((start, end, marker, label, ref))
 

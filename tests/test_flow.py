@@ -57,7 +57,7 @@ def _fake_run_ocr(image_path, work_dir, images_dir, prefix=""):
     name = f"{prefix}fig1.jpg"
     (images_dir / name).write_bytes(_jpeg("figure"))
     markdown = PAGE_MARKDOWN.replace("images/fig1.jpg", f"images/{name}")
-    return markdown, [name]
+    return markdown, [name], {}
 
 
 ocr.run_ocr = _fake_run_ocr
@@ -120,8 +120,8 @@ def test_full_flow():
         )
         assert response.status_code == 200
         labelled = response.json()["markdown"]
-        assert "*[Q2 附图]*" in labelled
-        assert labelled.index("*[Q2 附图]*") > labelled.index("2. Solve for $x$.")
+        assert "![Q2 附图](" in labelled
+        assert labelled.index("![Q2 附图](") > labelled.index("2. Solve for $x$.")
 
         # --- download: page wrappers present, figure inlined as base64 ---
         markdown = client.get(f"/tasks/{task_id}/download").text
@@ -142,6 +142,28 @@ def test_full_flow():
 
         # --- retry rejects a healthy page ---
         assert client.post(f"/api/tasks/{task_id}/pages/0/retry").status_code == 409
+
+
+def test_engine_suggested_mapping_is_stored_and_rendered():
+    """The hybrid engine's question numbers must land in the page mapping."""
+    original = ocr.run_ocr
+
+    def with_suggestion(image_path, work_dir, images_dir, prefix=""):
+        markdown, figures, _ = original(image_path, work_dir, images_dir, prefix)
+        return markdown, figures, {figures[0]: "16"} if figures else {}
+
+    ocr.run_ocr = with_suggestion
+    try:
+        with TestClient(app) as client:
+            task_id = _make_ready_task(client, "suggested")
+            page = client.get(f"/api/tasks/{task_id}/pages/0").json()
+            # Stored as a mapping, not baked into the text.
+            assert page["mapping"] == {"p1_fig1.jpg": "16"}
+            assert "附图" not in page["markdown"]
+            # ...and the renderer places it in the new markdown image format.
+            assert "![Q16 附图](images/p1_fig1.jpg)" in page["labelled_markdown"]
+    finally:
+        ocr.run_ocr = original
 
 
 def test_rejects_unsupported_and_unreadable_files():
@@ -227,7 +249,7 @@ def test_page_detail_reports_labels_and_questions():
         client.put(f"/api/tasks/{task_id}/pages/0/mapping", json={"p1_fig1.jpg": "2"})
         page = client.get(f"/api/tasks/{task_id}/pages/0").json()
         assert page["mapping"] == {"p1_fig1.jpg": "2"}
-        assert "*[Q2 附图]*" in page["labelled_markdown"]
+        assert "![Q2 附图](" in page["labelled_markdown"]
 
         # Blank values are dropped rather than stored.
         client.put(f"/api/tasks/{task_id}/pages/0/mapping", json={"p1_fig1.jpg": "  "})

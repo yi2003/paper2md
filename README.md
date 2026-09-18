@@ -67,9 +67,16 @@ To try it immediately there is a ready-made exam page in
 Both long-running steps show a progress bar: page reading (`n / total` pages)
 and the DeepSeek cleanup (figures uploaded, then cleaning).
 
-Figures the model found are copied into the markdown as
-`*[Q13 附图]*` immediately followed by the image, so a reader can always tell
-which diagram goes with which question.
+Each figure goes into the markdown as an image whose alt text names the question
+it belongs to, so the figure and its question stay together in any renderer:
+
+```markdown
+![Q17 附图](https://i.ibb.co/93sZK3jf/a6283adda502.jpg)
+![Q17 附图2](https://i.ibb.co/WqKW04v/d5ff1fbf1ec7.jpg)
+```
+
+A question with a single figure gets `附图`; a question with several numbers them
+`附图1`, `附图2`, so two diagrams under one question are still distinguishable.
 
 ---
 
@@ -126,9 +133,9 @@ and every figure. Question numbering is never changed.
 **How the figures survive an LLM.** Asking a chat model to re-emit
 `<img src="https://i.ibb.co/...">` is asking for a corrupted URL. So each figure
 is swapped for an opaque marker before the call — `[[FIG3-Q13]]`, "figure 3
-belongs to question 13" — and swapped back afterwards. The `*[Q13 附图]*` label
-is folded into the marker, so the model cannot reattach a figure to the wrong
-question. Anything the model drops is re-attached at the end rather than lost,
+belongs to question 13" — and swapped back afterwards. The label is read out of
+the image's alt text and folded into the marker, so the model cannot reattach a
+figure to the wrong question. Anything the model drops is re-attached at the end rather than lost,
 and the task page reports how many were recovered.
 
 On a real 4-page paper the cleanup removed **30% of the text** (all handwriting)
@@ -356,6 +363,9 @@ tools/               bench.py, concurrency.py, compare_polish.py
 data/                runtime: paper2md.db, uploads/<task>/{pages,images}
 ```
 
+Figure placement is engine-independent: whichever engine read the page, the
+question numbers it produced go into the mapping and the renderer does the rest.
+
 **Flow.** Uploading a page writes a JPEG to `data/uploads/<task>/pages/` and
 queues a job. A worker thread resizes the photo (and honours EXIF rotation),
 runs PaddleOCR-VL, copies the figures it found into `images/`, and stores the
@@ -367,8 +377,12 @@ can be resumed: pages left mid-flight are re-queued on the next start.
 `img_in_image_box_0_0_100_100.jpg` cannot overwrite each other. The filename is
 the stable key for the figure → question mapping.
 
-**Labelling.** Setting a figure to `13` moves that figure to just underneath
-question 13 and tags it `*[Q13 附图]*`. Figures you have not mapped yet stay
+**Labelling.** Question numbers are stored as a per-page mapping
+(`{filename: "13"}`), never written into the page text — the label is applied
+when markdown is rendered. That keeps the format changeable, lets the review
+screen override an engine's guess, and means a figure can be re-labelled without
+re-running OCR. Setting a figure to `13` moves that figure to just underneath
+question 13, emitting `![Q13 附图](url)`. Figures you have not mapped yet stay
 exactly where OCR put them — a partial mapping never shuffles the document.
 
 **Download.** Markdown is rebuilt from each page's stored markdown plus its

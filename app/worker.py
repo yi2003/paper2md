@@ -115,7 +115,17 @@ class OcrWorker:
         ocr.log(f"{label} started")
 
         try:
-            markdown, figures = ocr.run_ocr(job.image_path, work_dir, images_dir, prefix)
+            markdown, figures, suggested = ocr.run_ocr(
+                job.image_path, work_dir, images_dir, prefix
+            )
+            # An engine may work out which question each figure belongs to.
+            # Store it as the page's mapping — never baked into the text — so the
+            # renderer applies it and the user can adjust it in the review screen.
+            if suggested:
+                existing = store.get_page(job.task_id, job.page_index) or {}
+                if not (existing.get("label_mapping") or "").strip():
+                    store.set_page_mapping(job.task_id, job.page_index, suggested)
+                    ocr.log(f"{label} matched {len(suggested)} figure(s) to questions")
             store.mark_page_done(job.task_id, job.page_index, markdown, len(figures))
             ocr.log(f"{label} done ({len(figures)} figure(s))")
         except Exception as exc:  # noqa: BLE001 - recorded and shown in the UI

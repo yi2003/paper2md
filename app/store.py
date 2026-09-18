@@ -15,7 +15,7 @@ import uuid
 from typing import Any
 
 from . import config
-from .markdown_utils import merge_pages, page_markdown
+from .markdown_utils import extract_baked_labels, merge_pages, page_markdown
 
 # Page statuses
 QUEUED = "queued"
@@ -93,6 +93,40 @@ def init() -> None:
         _conn.commit()
 
 
+def _migrate_page_labels(connection: sqlite3.Connection) -> None:
+    """Move figure labels baked into page text into the page mapping.
+
+    Engines used to write "*[Q13 附图]*" into the stored markdown. Labels are
+    applied at render time now, so the baked ones are stripped and recovered as
+    a mapping. An existing mapping is never overwritten — the user's own numbers
+    win over whatever the engine guessed.
+    """
+    rows = connection.execute(
+        "SELECT task_id, page_index, markdown, label_mapping FROM pages "
+        "WHERE markdown IS NOT NULL AND markdown LIKE '%附图%'"
+    ).fetchall()
+
+    migrated = 0
+    for task_id, page_index, markdown, mapping_json in rows:
+        cleaned, found = extract_baked_labels(markdown)
+        if not found or cleaned == markdown:
+            continue
+        try:
+            existing = json.loads(mapping_json) if mapping_json else {}
+        except json.JSONDecodeError:
+            existing = {}
+        merged = {**found, **existing}
+        connection.execute(
+            "UPDATE pages SET markdown = ?, label_mapping = ? "
+            "WHERE task_id = ? AND page_index = ?",
+            (cleaned, json.dumps(merged, ensure_ascii=False), task_id, page_index),
+        )
+        migrated += 1
+
+    if migrated:
+        print(f"[store] moved baked figure labels to mappings on {migrated} page(s)")
+
+
 def _migrate(connection: sqlite3.Connection) -> None:
     """Add columns that were introduced after a database was first created."""
     columns = {row[1] for row in connection.execute("PRAGMA table_info(tasks)")}
@@ -105,6 +139,8 @@ def _migrate(connection: sqlite3.Connection) -> None:
     ):
         if name not in columns:
             connection.execute(ddl)
+
+    _migrate_page_labels(connection)
 
     # Tasks cleaned before polish_status existed took the column default
     # ('idle'), which understates reality: a stored cleaned paper means done.

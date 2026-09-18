@@ -141,7 +141,7 @@ def test_hybrid_places_figures_under_their_questions():
             "9. Simplify $x+y$.\n\n16. Explain the result.\n",
             [{"x1": 100, "y1": 100, "x2": 300, "y2": 200, "question": "9"}],
         )
-        markdown, figures = ocr.run_ocr_hybrid(page, work, images, "p1_")
+        markdown, figures, mapping = ocr.run_ocr_hybrid(page, work, images, "p1_")
     finally:
         ocr.layout.detect = saved_layout
         ocr.layout.figure_blocks = saved_blocks
@@ -149,10 +149,10 @@ def test_hybrid_places_figures_under_their_questions():
 
     assert len(figures) == 1
     assert "images/" + figures[0] in markdown
-    # The shared labelling code moved it under question 9 and tagged it.
-    assert "*[Q9 附图]*" in markdown
-    assert markdown.index("*[Q9 附图]*") > markdown.index("9. Simplify")
-    assert markdown.index("*[Q9 附图]*") < markdown.index("16. Explain")
+    # Labels are NOT baked into the stored markdown any more: the question
+    # numbers come back as a mapping and the renderer applies them.
+    assert mapping == {figures[0]: "9"}
+    assert "附图" not in markdown
 
 
 def test_hybrid_keeps_unplaced_figures_rather_than_dropping_them():
@@ -169,7 +169,7 @@ def test_hybrid_keeps_unplaced_figures_rather_than_dropping_them():
         ocr.layout.figure_blocks = lambda blocks, min_score=None: list(blocks)
         # No hints at all — DeepSeek gave no figure information.
         ocr.deepseek.read_page = lambda path, model=None: ("9. Simplify $x+y$.\n", [])
-        markdown, figures = ocr.run_ocr_hybrid(page, work, images, "p1_")
+        markdown, figures, mapping = ocr.run_ocr_hybrid(page, work, images, "p1_")
     finally:
         ocr.layout.detect = saved_layout
         ocr.layout.figure_blocks = saved_blocks
@@ -192,7 +192,7 @@ def test_hybrid_returns_cleanly_when_there_are_no_figures():
         ocr.layout.detect = lambda path: [Block("text", 0, 0, 900, 90, 0.9, 1)]
         ocr.layout.figure_blocks = lambda blocks, min_score=None: []
         ocr.deepseek.read_page = lambda path, model=None: ("9. Simplify $x+y$.\n", [])
-        markdown, figures = ocr.run_ocr_hybrid(page, work, images, "p1_")
+        markdown, figures, mapping = ocr.run_ocr_hybrid(page, work, images, "p1_")
     finally:
         ocr.layout.detect = saved_layout
         ocr.layout.figure_blocks = saved_blocks
@@ -214,8 +214,8 @@ def test_engine_selection():
     saved_paddle = ocr.run_ocr_paddle
     page = _page()
     try:
-        ocr.run_ocr_paddle = lambda *a, **k: ("paddle", [])
-        ocr.run_ocr_hybrid = lambda *a, **k: ("hybrid", [])
+        ocr.run_ocr_paddle = lambda *a, **k: ("paddle", [], {})
+        ocr.run_ocr_hybrid = lambda *a, **k: ("hybrid", [], {})
 
         config.OCR_ENGINE = "paddle"
         assert ocr.run_ocr(page, page.parent, page.parent, "")[0] == "paddle"
@@ -232,7 +232,7 @@ def test_engine_selection():
         assert ocr.run_ocr(page, page.parent, page.parent, "")[0] == "paddle"
 
         # ...and uses DeepSeek when it works.
-        ocr.run_ocr_hybrid = lambda *a, **k: ("hybrid", [])
+        ocr.run_ocr_hybrid = lambda *a, **k: ("hybrid", [], {})
         assert ocr.run_ocr(page, page.parent, page.parent, "")[0] == "hybrid"
     finally:
         config.OCR_ENGINE = saved_engine
@@ -252,7 +252,7 @@ def test_auto_falls_back_when_layout_fails():
             raise ocr.LayoutError("model missing")
 
         ocr.run_ocr_hybrid = broken
-        ocr.run_ocr_paddle = lambda *a, **k: ("paddle", [])
+        ocr.run_ocr_paddle = lambda *a, **k: ("paddle", [], {})
         config.OCR_ENGINE = "auto"
         assert ocr.run_ocr(page, page.parent, page.parent, "")[0] == "paddle"
     finally:

@@ -141,8 +141,12 @@ def run_ocr(
                    text (see :func:`run_ocr_hybrid`).
     ``auto``     — DeepSeek, falling back to Paddle if it fails.
 
-    Returns ``(markdown, figure_filenames)``; markdown references figures as
-    ``images/<prefixed filename>``.
+    Returns ``(markdown, figure_filenames, suggested_mapping)``. The markdown
+    references figures as ``images/<prefixed filename>``; ``suggested_mapping``
+    is ``{filename: "13"}`` for engines that can work out the question numbers
+    themselves, and is empty otherwise. Labels are never baked into the markdown
+    — they are applied at render time from the stored mapping, so the format can
+    change and the user can override it.
     """
     engine = config.OCR_ENGINE
 
@@ -219,7 +223,7 @@ def run_ocr_paddle(
             copied.append(target_name)
 
     log(f"markdown {len(markdown):,} chars, {len(copied)} figure(s)")
-    return markdown, copied
+    return markdown, copied, {}
 
 
 # --------------------------------------------------------------------------
@@ -360,22 +364,22 @@ def run_ocr_hybrid(
 
     if not names:
         log(f"markdown {len(markdown):,} chars, no figures")
-        return markdown, []
+        return markdown, [], {}
 
     # 4. Which question does each figure belong to?
     questions = _attach_questions(kept, hints, page_size)
     mapping = {name: q for name, q in zip(names, questions) if q}
 
-    # 5. Let the shared labelling code move them under their questions.
+    # 5. Append the figures. They are deliberately left unlabelled: the question
+    #    numbers go back as a mapping, so the renderer places them and the user
+    #    can correct them in the review screen.
     markdown = markdown.rstrip() + "\n\n" + "\n\n".join(
         f'<img src="images/{name}">' for name in names
     ) + "\n"
-    if mapping:
-        markdown = apply_labels_mapping(markdown, mapping)
 
     placed = sum(1 for q in questions if q)
     log(
         f"markdown {len(markdown):,} chars, {len(names)} figure(s), "
-        f"{placed} placed under a question"
+        f"{placed} matched to a question"
     )
-    return markdown, names
+    return markdown, names, mapping

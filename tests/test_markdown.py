@@ -7,6 +7,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.markdown_utils import (  # noqa: E402
     apply_labels_mapping,
+    extract_baked_labels,
     detect_questions,
     extract_filenames,
     merge_pages,
@@ -60,8 +61,8 @@ def test_mapping_moves_figure_under_its_question():
         md, {"img_in_image_box_100_50_300_200.jpg": "2"}
     )
     # The figure moved out of question 1 and now sits under question 2.
-    assert out.index("*[Q2 附图]*") > out.index("2. Solve for x.")
-    assert out.index("*[Q2 附图]*") < out.index("3. Prove the identity.")
+    assert out.index("![Q2 附图](") > out.index("2. Solve for x.")
+    assert out.index("![Q2 附图](") < out.index("3. Prove the identity.")
     first_image = out.index("img_in_image_box_100_50_300_200.jpg")
     assert first_image > out.index("2. Solve for x.")
 
@@ -78,22 +79,55 @@ def test_labels_are_idempotent():
     mapping = {"img_in_image_box_100_50_300_200.jpg": "Q1"}
     once = apply_labels_mapping(md, mapping)
     twice = apply_labels_mapping(once, mapping)
-    assert once.count("*[Q1 附图]*") == 1
-    assert twice.count("*[Q1 附图]*") == 1
+    assert once.count("![Q1 附图](") == 1
+    assert twice.count("![Q1 附图](") == 1
 
 
 def test_mapping_accepts_q_prefix_and_trailing_punctuation():
     md = normalize_markdown(PAGE)
     for value in ("Q2", "2", "2.", "2．"):
         out = apply_labels_mapping(md, {"img_in_image_box_100_50_300_200.jpg": value})
-        assert "*[Q2 附图]*" in out, value
+        assert "![Q2 附图](" in out, value
 
 
 def test_mapping_without_question_headers_falls_back_to_inline_labels():
     md = 'Intro text.\n\n<img src="images/a.jpg">\n\nMore text.'
     out = apply_labels_mapping(md, {"a.jpg": "7"})
-    assert "*[Q7 附图]*" in out
-    assert out.index("*[Q7 附图]*") < out.index("More text.")
+    assert "![Q7 附图](" in out
+    assert out.index("![Q7 附图](") < out.index("More text.")
+
+
+def test_baked_labels_are_recovered_from_old_markdown():
+    """Engines used to write the label into the text; recover it as a mapping."""
+    md = (
+        "13. Look.\n\n*[Q13 附图]*\n\n"
+        '<img src="images/a.jpg">\n\n14. And.\n\n*[Q14 附图]*\n\n'
+        '<img src="images/b.jpg">\n'
+    )
+    cleaned, mapping = extract_baked_labels(md)
+    assert mapping == {"a.jpg": "13", "b.jpg": "14"}
+    assert "附图" not in cleaned
+    assert "13. Look." in cleaned and "14. And." in cleaned
+    # The images themselves survive, ready to be re-labelled at render time.
+    assert "images/a.jpg" in cleaned and "images/b.jpg" in cleaned
+
+
+def test_baked_labels_are_recovered_from_the_alt_text_form():
+    md = (
+        "13. Look.\n\n![Q13 附图](images/a.jpg)\n\n"
+        "14. And.\n\n![Q14 附图1](images/b.jpg)\n![Q14 附图2](images/c.jpg)\n"
+    )
+    cleaned, mapping = extract_baked_labels(md)
+    assert mapping == {"a.jpg": "13", "b.jpg": "14", "c.jpg": "14"}
+    assert "附图" not in cleaned
+    assert "images/a.jpg" in cleaned and "images/c.jpg" in cleaned
+
+
+def test_baked_label_extraction_is_a_no_op_without_labels():
+    md = "13. Look.\n\n<img src=\"images/a.jpg\">\n"
+    cleaned, mapping = extract_baked_labels(md)
+    assert mapping == {}
+    assert cleaned == md
 
 
 def test_merge_pages_wraps_every_page():
@@ -132,8 +166,8 @@ def test_drop_and_assign_at_the_same_time():
         },
     )
     assert "img_in_image_box_100_50_300_200.jpg" not in out
-    assert "*[Q2 附图]*" in out
-    assert out.index("*[Q2 附图]*") > out.index("2. Solve for x.")
+    assert "![Q2 附图](" in out
+    assert out.index("![Q2 附图](") > out.index("2. Solve for x.")
 
 
 def test_drop_aliases_are_accepted():
@@ -147,7 +181,46 @@ def test_a_question_number_is_never_treated_as_a_drop():
     md = normalize_markdown(PAGE)
     out = apply_labels_mapping(md, {"img_in_image_box_100_50_300_200.jpg": "1"})
     assert "img_in_image_box_100_50_300_200.jpg" in out
-    assert "*[Q1 附图]*" in out
+    assert "![Q1 附图](" in out
+
+
+# --- the output format of a labelled figure ----------------------------------
+
+
+def test_labelled_figure_uses_markdown_image_syntax():
+    """The label belongs in the alt text, not on a separate line."""
+    md = normalize_markdown(PAGE)
+    out = apply_labels_mapping(md, {"img_in_image_box_100_50_300_200.jpg": "1"})
+    assert "![Q1 附图](images/img_in_image_box_100_50_300_200.jpg)" in out
+    assert "*[Q1 附图]*" not in out
+
+
+def test_multiple_figures_for_one_question_are_numbered():
+    md = normalize_markdown(
+        '13. First.\n\n<img src="images/a.jpg">\n\n<img src="images/b.jpg">\n'
+    )
+    out = apply_labels_mapping(md, {"a.jpg": "13", "b.jpg": "13"})
+    assert "![Q13 附图1](images/a.jpg)" in out
+    assert "![Q13 附图2](images/b.jpg)" in out
+    # A lone figure is not numbered.
+    out_one = apply_labels_mapping(
+        normalize_markdown('13. First.\n\n<img src="images/a.jpg">\n'), {"a.jpg": "13"}
+    )
+    assert "![Q13 附图](images/a.jpg)" in out_one
+    assert "附图1" not in out_one
+
+
+def test_formatting_is_idempotent():
+    """Re-applying must not stack labels or renumber differently."""
+    md = normalize_markdown(
+        '13. First.\n\n<img src="images/a.jpg">\n\n<img src="images/b.jpg">\n'
+    )
+    once = apply_labels_mapping(md, {"a.jpg": "13", "b.jpg": "13"})
+    twice = apply_labels_mapping(once, {"a.jpg": "13", "b.jpg": "13"})
+    assert once.count("![Q13 附图1](") == 1
+    assert twice.count("![Q13 附图1](") == 1
+    assert twice.count("![Q13 附图2](") == 1
+    assert "附图1 附图" not in twice
 
 
 def test_dropping_every_figure_leaves_clean_question_text():
