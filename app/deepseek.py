@@ -290,6 +290,7 @@ def _chat(
     parts: list[str] = []
     received = 0
     usage: dict[str, int] = {}
+    finish_reason: str | None = None
 
     try:
         with requests.post(
@@ -319,6 +320,8 @@ def _chat(
                 if event.get("usage"):
                     usage = event["usage"]
                 for choice in event.get("choices") or []:
+                    if choice.get("finish_reason"):
+                        finish_reason = choice["finish_reason"]
                     delta = choice.get("delta") or {}
                     piece = delta.get("content")
                     if piece:
@@ -341,12 +344,28 @@ def _chat(
     except requests.RequestException as exc:
         raise DeepSeekError(f"DeepSeek request failed: {exc}") from exc
 
+    _reject_truncated(finish_reason)
+
     content = "".join(parts).strip()
     if content:
         return content, usage
 
     log("streaming produced nothing; retrying as a single request")
     return _chat_blocking(markdown, model)
+
+
+def _reject_truncated(finish_reason: str | None) -> None:
+    """Fail loudly rather than return a silently incomplete paper.
+
+    Without this, a reply cut off at the output limit would look like a normal
+    success and the cleaned paper would simply be missing questions.
+    """
+    if finish_reason == "length":
+        raise DeepSeekError(
+            "DeepSeek hit its output limit before finishing, so the cleaned "
+            "paper would be missing content. Lower DEEPSEEK_MAX_CHARS so the "
+            "document is split into smaller chunks, then run it again."
+        )
 
 
 def _chat_blocking(markdown: str, model: str) -> tuple[str, dict[str, int]]:
@@ -377,9 +396,13 @@ def _chat_blocking(markdown: str, model: str) -> tuple[str, dict[str, int]]:
 
     try:
         body = response.json()
-        content = body["choices"][0]["message"]["content"]
+        choice = body["choices"][0]
+        content = choice["message"]["content"]
+        finish_reason = choice.get("finish_reason")
     except (ValueError, KeyError, IndexError, TypeError) as exc:
         raise DeepSeekError(f"unexpected response from DeepSeek: {exc}") from exc
+
+    _reject_truncated(finish_reason)
 
     if not content or not content.strip():
         raise DeepSeekError("DeepSeek returned an empty result")

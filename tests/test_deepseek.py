@@ -261,6 +261,61 @@ def test_chat_counts_reasoning_content_towards_progress():
         deepseek.requests.post = saved
 
 
+def test_truncated_stream_is_rejected_not_silently_accepted():
+    """A reply cut off at the output limit must never look like a success."""
+    saved = deepseek.requests.post
+    _patch_post(
+        [
+            'data: {"choices":[{"delta":{"content":"1. Partial question"}}]}',
+            'data: {"choices":[{"finish_reason":"length","delta":{}}]}',
+            "data: [DONE]",
+        ]
+    )
+    try:
+        deepseek._chat("text", "model")
+    except deepseek.DeepSeekError as exc:
+        assert "output limit" in str(exc)
+    else:
+        raise AssertionError("a truncated reply must not be accepted")
+    finally:
+        deepseek.requests.post = saved
+
+
+def test_truncated_blocking_response_is_rejected():
+    saved = deepseek.requests.post
+    _patch_post(
+        ["data: [DONE]"],
+        blocking_body={
+            "choices": [{"message": {"content": "partial"}, "finish_reason": "length"}],
+            "usage": {},
+        },
+    )
+    try:
+        deepseek._chat("text", "model")
+    except deepseek.DeepSeekError as exc:
+        assert "output limit" in str(exc)
+    else:
+        raise AssertionError("expected DeepSeekError")
+    finally:
+        deepseek.requests.post = saved
+
+
+def test_a_normal_stop_is_accepted():
+    saved = deepseek.requests.post
+    _patch_post(
+        [
+            'data: {"choices":[{"delta":{"content":"complete"}}]}',
+            'data: {"choices":[{"finish_reason":"stop","delta":{}}]}',
+            "data: [DONE]",
+        ]
+    )
+    try:
+        content, _ = deepseek._chat("text", "model")
+        assert content == "complete"
+    finally:
+        deepseek.requests.post = saved
+
+
 def test_soft_fraction_is_monotonic_and_never_completes():
     fractions = [deepseek._soft_fraction(n, 1000) for n in range(0, 6000, 250)]
     assert fractions[0] == 0.0
