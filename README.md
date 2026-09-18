@@ -181,6 +181,44 @@ Re-run it on your own pages with `tools/image_vs_text.py <task_id> <page_index>`
 which does both passes and diffs them. Two pages is a small sample: on a page
 where the OCR text is badly garbled, the photo may well help.
 
+### Handwriting that got extracted as a figure
+
+PaddleOCR-VL occasionally cuts a region of **handwriting** out as if it were a
+figure — a student's working, a tick, a circled option letter — and those end up
+embedded in the finished paper. The cleanup pass cannot help with these: by then
+they are images, not text. Two controls on the review screen deal with it.
+
+**Delete one by hand.** Every figure card has an **✕** button. Pressing it marks
+that figure for deletion (the card greys out so the decision is reversible) and
+keeps it out of the preview and every download. Under the hood the mapping value
+becomes `drop`, which `apply_labels_mapping()` acts on — the same place question
+numbers are applied, so deleting and labelling compose naturally.
+
+**Find them automatically.** **🔍 Detect handwriting** sends each figure on the
+page to DeepSeek's vision model and asks one narrow question: printed material, or
+handwriting? Cards get labelled `printed` or `looks handwritten`, and the
+unassigned handwriting is marked for removal. A figure you have already given a
+question number is only flagged, never deleted.
+
+That narrow question is where vision genuinely works well — unlike the whole-page
+cleanup, where it measured *worse*. On real crops from these papers:
+
+| figure | classified | correct? |
+|---|---|---|
+| printed cylinder diagram (65×90) | `printed` | ✅ |
+| printed geometric figure (65×43) | `printed` | ✅ |
+| handwritten "B)" with pen stroke (112×64) | `handwritten` | ✅ |
+| handwritten algebra over a printed diagram (492×150) | `handwritten` | ✅ |
+
+Note the last row: a region can contain **both** a printed diagram and
+handwriting. The classifier makes a judgement call, which is exactly why the
+result is a suggestion you can override with **✕** rather than an automatic
+delete.
+
+On one real page all 6 extracted "figures" were handwriting; marking them
+removed every one, taking the downloaded paper from 5,696 to 4,997 characters
+with no false positives.
+
 ### Performance
 
 CPU inference is slow and, by default, badly under-uses a modern machine: a

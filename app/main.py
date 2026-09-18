@@ -19,7 +19,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTex
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from . import config, image_host, store
+from . import config, deepseek, image_host, store
 from .markdown_utils import (
     detect_questions,
     extract_filenames,
@@ -375,6 +375,49 @@ async def api_save_mapping(
         "page_index": page_index,
         "mapping": mapping,
         "markdown": page_markdown(page["markdown"] or "", json.dumps(mapping)),
+    }
+
+
+# --------------------------------------------------------------------------
+# Figure classification (handwriting vs printed diagram)
+# --------------------------------------------------------------------------
+
+
+@app.post("/api/tasks/{task_id}/pages/{page_index}/classify-figures")
+async def api_classify_figures(task_id: str, page_index: int):
+    """Ask DeepSeek which of this page's figures are handwriting, not diagrams.
+
+    PaddleOCR-VL sometimes cuts a region of handwriting out as a "figure", so it
+    ends up embedded in the finished paper. This flags those; the caller decides
+    what to do with the answer.
+    """
+    page = _page_or_404(task_id, page_index)
+    if page["status"] != store.DONE:
+        raise HTTPException(400, f"Page {page_index + 1} is not ready yet")
+    if not config.deepseek_ready():
+        raise HTTPException(
+            400, "DEEPSEEK_API_KEY is not set — add it to .env and restart the app"
+        )
+
+    names = extract_filenames(page["markdown"] or "")
+    if not names:
+        return {"task_id": task_id, "page_index": page_index, "kinds": {}, "handwritten": []}
+
+    images_dir = config.images_dir(task_id)
+    paths = [images_dir / name for name in names if (images_dir / name).is_file()]
+    if not paths:
+        raise HTTPException(404, "No figure files found on disk for this page")
+
+    log(f"[{task_id}] classifying {len(paths)} figure(s) on page {page_index + 1}")
+    kinds = await asyncio.to_thread(deepseek.classify_figures, paths)
+    handwritten = [name for name, kind in kinds.items() if kind == deepseek.HANDWRITTEN]
+    log(f"[{task_id}] page {page_index + 1}: {len(handwritten)} look handwritten")
+
+    return {
+        "task_id": task_id,
+        "page_index": page_index,
+        "kinds": kinds,
+        "handwritten": handwritten,
     }
 
 

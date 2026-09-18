@@ -192,13 +192,20 @@ def _label_in_place(md: str, mapping: dict[str, str]) -> str:
     return _ANY_IMG_RE.sub(repl, md)
 
 
-def apply_labels_mapping(md: str, mapping: dict[str, str]) -> str:
-    """Attach figures to the questions they were mapped to.
+# Mapping values that mean "delete this figure" rather than "put it under Qn".
+DROP_VALUES = {"drop", "remove", "delete", "hide", "x", "-", "✕", "✗", "❌"}
 
-    Figures that were given a question number are moved directly underneath that
-    question's text and tagged with ``*[Q<N> 附图]*``. Figures the user has not
-    mapped yet stay exactly where OCR put them, so a partial mapping never
-    shuffles the document around.
+
+def apply_labels_mapping(md: str, mapping: dict[str, str]) -> str:
+    """Attach figures to their questions, and delete the ones marked to drop.
+
+    A mapping value of ``"13"`` moves that figure under question 13 and tags it
+    ``*[Q13 附图]*``. A value in :data:`DROP_VALUES` removes the figure from the
+    document entirely — which is how a region the OCR mistook for a figure, such
+    as a student's handwritten working, gets erased.
+
+    Figures with no mapping at all stay exactly where OCR put them, so a partial
+    mapping never shuffles the document around.
     """
     md = strip_labels(md or "")
     if not md.strip():
@@ -206,13 +213,24 @@ def apply_labels_mapping(md: str, mapping: dict[str, str]) -> str:
 
     available = set(extract_filenames(md))
     resolved: dict[str, str] = {}
+    dropped: set[str] = set()
+
     for name, value in (mapping or {}).items():
+        if name not in available:
+            continue
+        if str(value).strip().lower() in DROP_VALUES:
+            dropped.add(name)
+            continue
         question = _normalize_question(value)
-        if question and name in available:
+        if question:
             resolved[name] = question
 
-    if not resolved:
+    if not resolved and not dropped:
         return md
+
+    # Deletions only — there is no question to move anything under.
+    if not resolved:
+        return _remove_images(md, dropped).strip() + "\n"
 
     grouped: dict[str, list[str]] = {}
     texts: dict[str, str] = {}
@@ -221,11 +239,11 @@ def apply_labels_mapping(md: str, mapping: dict[str, str]) -> str:
             grouped.setdefault(resolved[name], []).append(name)
             texts.setdefault(name, text)
 
-    body = _remove_images(md, set(resolved))
+    body = _remove_images(md, set(resolved) | dropped)
     headers = [(m.start(), str(int(m.group(1)))) for m in _QUESTION_RE.finditer(body)]
 
     if not headers:
-        return _label_in_place(md, resolved)
+        return _label_in_place(_remove_images(md, dropped), resolved)
 
     parts: list[str] = []
     cursor = 0

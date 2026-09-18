@@ -15,10 +15,12 @@ lost.
 
 from __future__ import annotations
 
+import base64
 import json
 import math
 import re
 import sys
+from pathlib import Path
 from typing import Any, Callable
 
 import requests
@@ -408,6 +410,118 @@ def _chat_blocking(markdown: str, model: str) -> tuple[str, dict[str, int]]:
         raise DeepSeekError("DeepSeek returned an empty result")
 
     return content.strip(), body.get("usage", {}) or {}
+
+
+# --------------------------------------------------------------------------
+# Figure classification
+# --------------------------------------------------------------------------
+#
+# PaddleOCR-VL sometimes cuts a region of handwriting out as a "figure" — a
+# student's working, a tick, a circled option letter. Those end up embedded in
+# the finished paper. Telling them apart from real diagrams is a narrow visual
+# question, and deepseek-flash answers it well: on real crops it correctly kept
+# a printed cylinder diagram and a printed geometric figure, and flagged a
+# handwritten "B)" and a block of handwritten algebra.
+
+FIGURE_PROMPT = """\
+This is a small region cut out of a photographed exam paper by OCR.
+
+Classify it as exactly one word:
+
+PRINTED - typeset material: a diagram, chart, graph, table, geometric figure, map, or printed text.
+HANDWRITTEN - written by hand: a student's working, answer, notes, ticks, crosses, underlines, or a handwritten option letter.
+
+Answer with one word only: PRINTED or HANDWRITTEN."""
+
+PRINTED = "printed"
+HANDWRITTEN = "handwritten"
+UNKNOWN = "unknown"
+
+
+def classify_figure(path: Path, model: str | None = None) -> str:
+    """Is this extracted figure printed material or handwriting?
+
+    Returns ``"printed"``, ``"handwritten"`` or ``"unknown"`` — the last when the
+    model declines to answer, so the caller keeps the figure rather than
+    silently deleting content.
+    """
+    if not config.DEEPSEEK_API_KEY:
+        raise DeepSeekError("DEEPSEEK_API_KEY is not set")
+    if not path.is_file():
+        return UNKNOWN
+
+    encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+    payload = {
+        "model": model or resolve_model(),
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": FIGURE_PROMPT},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/jpeg;base64,{encoded}"},
+                    },
+                ],
+            }
+        ],
+        "temperature": 0,
+        # Generous: the model spends reasoning tokens before answering, and a
+        # stingy cap leaves the answer empty.
+        "max_tokens": 4000,
+    }
+
+    try:
+        response = requests.post(
+            f"{config.DEEPSEEK_BASE_URL}/chat/completions",
+            headers=_headers(),
+            json=payload,
+            timeout=config.DEEPSEEK_TIMEOUT,
+        )
+    except requests.RequestException as exc:
+        raise DeepSeekError(f"DeepSeek request failed: {exc}") from exc
+
+    if response.status_code == 401:
+        raise DeepSeekError("DeepSeek rejected the API key (401 Unauthorized)")
+    if not response.ok:
+        raise DeepSeekError(
+            f"DeepSeek returned HTTP {response.status_code}: {response.text[:200]}"
+        )
+
+    try:
+        answer = (
+            response.json()["choices"][0]["message"].get("content") or ""
+        ).strip().upper()
+    except (ValueError, KeyError, IndexError, TypeError) as exc:
+        raise DeepSeekError(f"unexpected response from DeepSeek: {exc}") from exc
+
+    if "HANDWRITTEN" in answer:
+        return HANDWRITTEN
+    if "PRINTED" in answer:
+        return PRINTED
+    log(f"could not classify {path.name}: {answer[:60]!r}")
+    return UNKNOWN
+
+
+def classify_figures(
+    paths: list[Path],
+    progress: Callable[[int, int], None] | None = None,
+) -> dict[str, str]:
+    """Classify several figures. Returns ``{filename: kind}``."""
+    results: dict[str, str] = {}
+    total = len(paths)
+    for index, path in enumerate(paths, start=1):
+        try:
+            results[path.name] = classify_figure(path)
+        except DeepSeekError as exc:
+            log(f"classification failed for {path.name}: {exc}")
+            results[path.name] = UNKNOWN
+        if progress is not None:
+            try:
+                progress(index, total)
+            except Exception:  # noqa: BLE001, S110 - progress is best-effort
+                pass
+    return results
 
 
 # --------------------------------------------------------------------------

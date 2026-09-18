@@ -325,6 +325,80 @@ def test_soft_fraction_is_monotonic_and_never_completes():
     assert deepseek._soft_fraction(0, 0) == 0.0
 
 
+# --- figure classification (mocked; no network) ------------------------------
+
+
+class _ClassifyResponse:
+    def __init__(self, content, status_code=200):
+        self._content = content
+        self.status_code = status_code
+        self.ok = status_code == 200
+        self.text = ""
+
+    def json(self):
+        return {"choices": [{"message": {"content": self._content}}]}
+
+
+def test_classify_figure_parses_the_answer():
+    import tempfile
+    from pathlib import Path
+
+    saved_post = deepseek.requests.post
+    saved_key = deepseek.config.DEEPSEEK_API_KEY
+    deepseek.config.DEEPSEEK_API_KEY = "test-key"
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            figure = Path(tmp) / "fig.jpg"
+            figure.write_bytes(b"\xff\xd8\xff\xd9")
+            for answer, expected in [
+                ("PRINTED", deepseek.PRINTED),
+                ("handwritten", deepseek.HANDWRITTEN),
+                ("Handwritten.", deepseek.HANDWRITTEN),
+                ("The answer is PRINTED", deepseek.PRINTED),
+                ("I am not sure", deepseek.UNKNOWN),
+                ("", deepseek.UNKNOWN),
+            ]:
+                deepseek.requests.post = lambda url, _a=answer, **kw: _ClassifyResponse(_a)
+                assert deepseek.classify_figure(figure) == expected, answer
+    finally:
+        deepseek.requests.post = saved_post
+        deepseek.config.DEEPSEEK_API_KEY = saved_key
+
+
+def test_classify_figure_returns_unknown_for_a_missing_file():
+    from pathlib import Path
+
+    saved_key = deepseek.config.DEEPSEEK_API_KEY
+    deepseek.config.DEEPSEEK_API_KEY = "test-key"
+    try:
+        assert deepseek.classify_figure(Path("/nonexistent/a.jpg")) == deepseek.UNKNOWN
+    finally:
+        deepseek.config.DEEPSEEK_API_KEY = saved_key
+
+
+def test_classify_figures_keeps_a_failure_from_aborting_the_batch():
+    """An unreadable figure must not stop the rest being classified."""
+    import tempfile
+    from pathlib import Path
+
+    saved_post = deepseek.requests.post
+    saved_key = deepseek.config.DEEPSEEK_API_KEY
+    deepseek.config.DEEPSEEK_API_KEY = "test-key"
+    deepseek.requests.post = lambda url, **kw: _ClassifyResponse("HANDWRITTEN")
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            good = Path(tmp) / "good.jpg"
+            good.write_bytes(b"\xff\xd8\xff\xd9")
+            result = deepseek.classify_figures([good, Path(tmp) / "missing.jpg"])
+            assert result == {
+                "good.jpg": deepseek.HANDWRITTEN,
+                "missing.jpg": deepseek.UNKNOWN,
+            }
+    finally:
+        deepseek.requests.post = saved_post
+        deepseek.config.DEEPSEEK_API_KEY = saved_key
+
+
 def test_chat_reports_bad_key_clearly():
     saved = deepseek.requests.post
 

@@ -31,6 +31,10 @@
     Upload figures ({{ image_host }})
   </button>
   {% if deepseek_ready and all_pages_done %}
+  <button id="detectBtn"
+          title="Ask DeepSeek which of these figures are handwriting rather than printed diagrams">
+    🔍 Detect handwriting
+  </button>
   <button id="polishBtn"
           title="Send the whole paper to DeepSeek: removes handwritten answers and keeps only questions with their figures">
     ✨ Clean up ({{ deepseek_model }})
@@ -62,8 +66,10 @@
     <div class="panel">
       <h2>Figures on this page</h2>
       <p class="hint">
-        Type the question number each figure belongs to. Changes save automatically
+        Type the question number each figure belongs to — changes save automatically
         and the figure moves under that question in the preview.
+        OCR sometimes cuts a patch of <b>handwriting</b> out as a figure: press
+        <b>✕</b> to delete one, or use <b>Detect handwriting</b> to find them all.
       </p>
       <div class="questions" id="questionChips"></div>
       <div class="figures" id="figures" style="margin-top:12px"></div>
@@ -101,6 +107,14 @@ function showMarkdown(markdown) {
   decoratePreview();
 }
 
+// The mapping value that means "delete this figure" — must match DROP_VALUES
+// in app/markdown_utils.py.
+const DROP = "drop";
+
+function isDropped(value) {
+  return String(value || "").trim().toLowerCase() === DROP;
+}
+
 function figureCard(name, index) {
   const card = document.createElement("div");
   card.className = "figure";
@@ -123,14 +137,29 @@ function figureCard(name, index) {
   label.textContent = `#${index + 1} · question`;
   const input = document.createElement("input");
   input.type = "text";
-  input.inputMode = "numeric";
   input.placeholder = "e.g. 13";
   input.dataset.role = "q";
   input.addEventListener("input", scheduleSave);
   input.addEventListener("blur", () => saveMapping({ immediate: true }));
 
-  row.append(label, input);
-  body.append(filename, row);
+  // Delete this figure outright — for regions the OCR mistook for a diagram.
+  const dropBtn = document.createElement("button");
+  dropBtn.type = "button";
+  dropBtn.dataset.role = "drop";
+  dropBtn.textContent = "✕";
+  dropBtn.title = "Delete this figure from the paper";
+  dropBtn.addEventListener("click", () => {
+    input.value = isDropped(input.value) ? "" : DROP;
+    markAssigned();
+    saveMapping({ immediate: true });
+  });
+
+  const kind = document.createElement("span");
+  kind.className = "kind";
+  kind.dataset.role = "kind";
+
+  row.append(label, input, dropBtn);
+  body.append(filename, row, kind);
   card.append(image, body);
   return card;
 }
@@ -168,7 +197,10 @@ function renderChips() {
 function markAssigned() {
   const mapping = currentMapping();
   figuresEl.querySelectorAll(".figure").forEach((card) => {
-    card.classList.toggle("assigned", !!mapping.get(card.dataset.name));
+    const value = card.querySelector('[data-role="q"]').value;
+    const dropped = isDropped(value);
+    card.classList.toggle("dropped", dropped);
+    card.classList.toggle("assigned", !dropped && !!mapping.get(card.dataset.name));
   });
 }
 
@@ -177,9 +209,14 @@ function markAssigned() {
 function currentMapping() {
   const mapping = new Map();
   figuresEl.querySelectorAll(".figure").forEach((card) => {
-    const value = card.querySelector('[data-role="q"]').value.trim();
-    const question = value.replace(/^[Qq]/, "").replace(/[.、,．)]$/, "");
-    if (question && /^\d+$/.test(question)) mapping.set(card.dataset.name, String(Number(question)));
+    const raw = card.querySelector('[data-role="q"]').value.trim();
+    if (!raw) return;
+    if (isDropped(raw)) {
+      mapping.set(card.dataset.name, DROP);
+      return;
+    }
+    const question = raw.replace(/^[Qq]/, "").replace(/[.、,．)]$/, "");
+    if (/^\d+$/.test(question)) mapping.set(card.dataset.name, String(Number(question)));
   });
   return mapping;
 }
@@ -306,6 +343,57 @@ document.getElementById("hostBtn").addEventListener("click", async (event) => {
     button.textContent = original;
   }
 });
+
+const detectBtn = document.getElementById("detectBtn");
+if (detectBtn) {
+  detectBtn.addEventListener("click", async () => {
+    const original = detectBtn.textContent;
+    detectBtn.disabled = true;
+    detectBtn.textContent = "Detecting… (may take a minute)";
+    try {
+      await saveMapping({ immediate: true });
+      const result = await api(
+        `/api/tasks/${TASK_ID}/pages/${PAGE_INDEX}/classify-figures`,
+        { method: "POST" }
+      );
+
+      // Label every card with what the model saw.
+      let flagged = 0;
+      figuresEl.querySelectorAll(".figure").forEach((card) => {
+        const kind = result.kinds[card.dataset.name];
+        const kindEl = card.querySelector('[data-role="kind"]');
+        kindEl.textContent = kind === "printed"
+          ? "printed"
+          : kind === "handwritten" ? "looks handwritten" : "";
+        kindEl.className = `kind ${kind || ""}`;
+      });
+
+      // Only auto-remove the unassigned ones, so a number you typed survives.
+      const toDrop = [];
+      figuresEl.querySelectorAll(".figure").forEach((card) => {
+        if (!(result.handwritten || []).includes(card.dataset.name)) return;
+        flagged += 1;
+        const input = card.querySelector('[data-role="q"]');
+        if (!input.value.trim()) toDrop.push(input);
+      });
+      toDrop.forEach((input) => { input.value = DROP; });
+
+      if (toDrop.length) await saveMapping({ immediate: true });
+      else markAssigned();
+
+      if (flagged) {
+        toast(`${flagged} figure(s) look handwritten — ${toDrop.length} marked for removal`);
+      } else {
+        toast("No handwritten figures found on this page");
+      }
+    } catch (error) {
+      toast(error.message, true);
+    } finally {
+      detectBtn.disabled = false;
+      detectBtn.textContent = original;
+    }
+  });
+}
 
 const polishBtn = document.getElementById("polishBtn");
 const polishProgressEl = document.getElementById("polishProgress");

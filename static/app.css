@@ -242,6 +242,23 @@ tbody tr:hover { background: #fafbfc; }
 .figure .seq { font-size: 11px; color: var(--muted); }
 .figure.assigned { border-color: #bcd0f7; background: #fbfdff; }
 
+/* Marked for deletion — kept visible and greyed so it can be undone. */
+.figure.dropped {
+  opacity: .5;
+  border-color: #f0c4c4;
+  background: #fdf7f7;
+}
+.figure.dropped img { filter: grayscale(1); }
+.figure .kind { font-size: 11px; margin-top: 3px; }
+.figure .kind.printed { color: var(--ok); }
+.figure .kind.handwritten { color: var(--err); font-weight: 600; }
+.figure [data-role="drop"] { padding: 5px 9px; line-height: 1; color: var(--muted); }
+.figure.dropped [data-role="drop"] {
+  color: #fff;
+  background: var(--err);
+  border-color: var(--err);
+}
+
 .questions { display: flex; flex-wrap: wrap; gap: 5px; }
 .chip {
   font-size: 11px; padding: 1px 7px; border-radius: 999px;

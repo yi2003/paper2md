@@ -103,6 +103,68 @@ def test_merge_pages_wraps_every_page():
     assert merged.index("one") < merged.index("two")
 
 
+# --- dropping figures (handwriting the OCR mistook for a diagram) ------------
+
+
+def test_drop_removes_the_figure_entirely():
+    md = normalize_markdown(PAGE)
+    out = apply_labels_mapping(md, {"img_in_image_box_100_50_300_200.jpg": "drop"})
+    assert "img_in_image_box_100_50_300_200.jpg" not in out
+    # The other figure is untouched.
+    assert "img_in_image_box_400_60_600_210.jpg" in out
+    assert "1. Simplify the expression below." in out
+
+
+def test_drop_works_with_no_question_headers():
+    md = 'Intro.\n\n<img src="images/a.jpg">\n\nOutro.'
+    out = apply_labels_mapping(md, {"a.jpg": "DROP"})
+    assert "a.jpg" not in out
+    assert "Intro." in out and "Outro." in out
+
+
+def test_drop_and_assign_at_the_same_time():
+    md = normalize_markdown(PAGE)
+    out = apply_labels_mapping(
+        md,
+        {
+            "img_in_image_box_100_50_300_200.jpg": "drop",
+            "img_in_image_box_400_60_600_210.jpg": "2",
+        },
+    )
+    assert "img_in_image_box_100_50_300_200.jpg" not in out
+    assert "*[Q2 附图]*" in out
+    assert out.index("*[Q2 附图]*") > out.index("2. Solve for x.")
+
+
+def test_drop_aliases_are_accepted():
+    md = normalize_markdown(PAGE)
+    for value in ("drop", "DROP", " remove ", "x", "✕", "-"):
+        out = apply_labels_mapping(md, {"img_in_image_box_100_50_300_200.jpg": value})
+        assert "img_in_image_box_100_50_300_200.jpg" not in out, value
+
+
+def test_a_question_number_is_never_treated_as_a_drop():
+    md = normalize_markdown(PAGE)
+    out = apply_labels_mapping(md, {"img_in_image_box_100_50_300_200.jpg": "1"})
+    assert "img_in_image_box_100_50_300_200.jpg" in out
+    assert "*[Q1 附图]*" in out
+
+
+def test_dropping_every_figure_leaves_clean_question_text():
+    md = normalize_markdown(PAGE)
+    out = apply_labels_mapping(
+        md,
+        {
+            "img_in_image_box_100_50_300_200.jpg": "drop",
+            "img_in_image_box_400_60_600_210.jpg": "drop",
+        },
+    )
+    assert "<img" not in out
+    assert "附图" not in out
+    assert "1. Simplify the expression below." in out
+    assert "3. Prove the identity." in out
+
+
 def test_merge_pages_keeps_numbering_when_a_page_is_empty():
     merged = merge_pages(["one", "", "three"])
     assert "<!-- page 3 -->" in merged
