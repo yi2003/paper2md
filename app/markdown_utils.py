@@ -145,7 +145,7 @@ def detect_questions(md: str) -> list[str]:
     return numbers
 
 
-def _normalize_question(value: object) -> str:
+def normalize_question(value: object) -> str:
     """``"Q13"`` / ``"13."`` / ``13`` -> ``"13"``; anything unusable -> ``""``."""
     if value is None:
         return ""
@@ -221,7 +221,7 @@ def apply_labels_mapping(md: str, mapping: dict[str, str]) -> str:
         if str(value).strip().lower() in DROP_VALUES:
             dropped.add(name)
             continue
-        question = _normalize_question(value)
+        question = normalize_question(value)
         if question:
             resolved[name] = question
 

@@ -26,6 +26,7 @@ from typing import Any, Callable
 import requests
 
 from . import config
+from .markdown_utils import normalize_question
 
 # Any figure reference, HTML or markdown, local path or remote URL.
 _ANY_IMG_RE = re.compile(r"<img\s[^>]*?>|!\[[^\]]*\]\([^)]*\)", re.IGNORECASE)
@@ -410,6 +411,142 @@ def _chat_blocking(markdown: str, model: str) -> tuple[str, dict[str, int]]:
         raise DeepSeekError("DeepSeek returned an empty result")
 
     return content.strip(), body.get("usage", {}) or {}
+
+
+# --------------------------------------------------------------------------
+# Whole-page reading (the hybrid engine)
+# --------------------------------------------------------------------------
+#
+# One call reads the page *and* removes the handwriting — no separate cleanup
+# pass. Figures are located by DeepSeek only loosely, so the caller crops them
+# from the precise local layout boxes instead; what we need from DeepSeek here
+# is which question each figure belongs to.
+
+PAGE_PROMPT = """\
+This is a photographed exam paper page. Read it.
+
+PART 1 - TEXT
+Transcribe the PRINTED text into GitHub-flavoured Markdown, mathematics as
+LaTeX ($...$ or $$...$$). Keep the question numbers exactly as printed.
+REMOVE anything handwritten by the student: answers written into blanks, working,
+notes, ticks, crosses, underlines, circled option letters. Where an answer was
+written in, leave an empty blank: \\underline{\\hspace{2em}}.
+
+PART 2 - FIGURES
+List every FIGURE on the page: a diagram, chart, graph, geometric drawing, or
+picture. Do NOT list plain text, and do NOT list handwriting.
+For each figure give:
+  "x1","y1","x2","y2" - its bounding box in integers 0-1000, scaled to the image
+                        width and height (so x1..x2 is 0..1000 across, y1..y2 down)
+  "question"          - the number of the question this figure belongs to, as a
+                        string, or "" if it is not attached to one
+
+Reply with JSON only, no code fences:
+
+{"markdown": "...", "figures": [{"x1": 0, "y1": 0, "x2": 0, "y2": 0, "question": "13"}]}
+"""
+
+
+def read_page(image_path: Path, model: str | None = None) -> tuple[str, list[dict[str, Any]]]:
+    """Read a whole page with DeepSeek.
+
+    Returns ``(markdown, figures)`` where each figure is
+    ``{"x1","y1","x2","y2", "question"}`` in normalised 0-1000 coordinates.
+    """
+    if not config.DEEPSEEK_API_KEY:
+        raise DeepSeekError("DEEPSEEK_API_KEY is not set")
+    if not image_path.is_file():
+        raise DeepSeekError(f"page image not found: {image_path}")
+
+    encoded = base64.b64encode(image_path.read_bytes()).decode("ascii")
+    payload = {
+        "model": model or resolve_model(),
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": PAGE_PROMPT},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/jpeg;base64,{encoded}"},
+                    },
+                ],
+            }
+        ],
+        "temperature": 0,
+        "max_tokens": 32000,
+    }
+
+    try:
+        response = requests.post(
+            f"{config.DEEPSEEK_BASE_URL}/chat/completions",
+            headers=_headers(),
+            json=payload,
+            timeout=config.DEEPSEEK_TIMEOUT,
+        )
+    except requests.RequestException as exc:
+        raise DeepSeekError(f"DeepSeek request failed: {exc}") from exc
+
+    if response.status_code == 401:
+        raise DeepSeekError("DeepSeek rejected the API key (401 Unauthorized)")
+    if not response.ok:
+        raise DeepSeekError(
+            f"DeepSeek returned HTTP {response.status_code}: {response.text[:300]}"
+        )
+
+    body = response.json()
+    try:
+        choice = body["choices"][0]
+        text = choice["message"].get("content") or ""
+        finish = choice.get("finish_reason")
+    except (KeyError, IndexError, TypeError) as exc:
+        raise DeepSeekError(f"unexpected response from DeepSeek: {exc}") from exc
+
+    _reject_truncated(finish)
+    if not text.strip():
+        raise DeepSeekError("DeepSeek returned an empty page")
+
+    parsed = _extract_json(text)
+    if parsed is None:
+        # No JSON: still usable if it wrote markdown, just without figure links.
+        log("page reply had no JSON; keeping the text and dropping figure hints")
+        return _PAGE_MARKER_RE.sub("", text).strip(), []
+
+    markdown = _PAGE_MARKER_RE.sub("", str(parsed.get("markdown") or "")).strip()
+    if not markdown:
+        raise DeepSeekError("DeepSeek returned no markdown for the page")
+
+    figures: list[dict[str, Any]] = []
+    for raw in parsed.get("figures") or []:
+        if not isinstance(raw, dict):
+            continue
+        try:
+            box = {key: int(round(float(raw[key]))) for key in ("x1", "y1", "x2", "y2")}
+        except (KeyError, TypeError, ValueError):
+            continue
+        question = normalize_question(raw.get("question"))
+        box["question"] = question
+        figures.append(box)
+
+    log(f"page reply: {len(markdown):,} chars, {len(figures)} figure hint(s)")
+    return markdown, figures
+
+
+def _extract_json(text: str) -> dict[str, Any] | None:
+    """Pull the JSON object out of a reply that may wrap it in prose/fences."""
+    fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.S)
+    candidates = [fenced.group(1)] if fenced else []
+    start, end = text.find("{"), text.rfind("}")
+    if start != -1 and end > start:
+        candidates.append(text[start : end + 1])
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return None
 
 
 # --------------------------------------------------------------------------

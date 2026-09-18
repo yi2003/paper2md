@@ -581,6 +581,7 @@ async def health():
     return {
         "status": "ok",
         "queue": worker.pending,
+        "ocr_engine": config.OCR_ENGINE,
         "ocr_workers": config.OCR_WORKERS,
         "image_host": config.IMAGE_HOST,
         "imgbb_configured": bool(config.IMGBB_API_KEY),

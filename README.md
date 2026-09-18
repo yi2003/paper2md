@@ -219,6 +219,62 @@ On one real page all 6 extracted "figures" were handwriting; marking them
 removed every one, taking the downloaded paper from 5,696 to 4,997 characters
 with no false positives.
 
+### Which engine reads a page
+
+```bash
+OCR_ENGINE=auto      # auto | paddle | deepseek
+```
+
+| engine | how it works | time/page | needs |
+|---|---|---|---|
+| `paddle` | PaddleOCR-VL end to end | ~90–130 s | nothing (local, offline) |
+| `deepseek` | local layout detection for the figure boxes + DeepSeek vision for the text | **~8 s** | DeepSeek API key |
+| `auto` | `deepseek`, falling back to `paddle` if the API or layout model fails | — | key, but degrades safely |
+
+**`auto` is the default.** It measured **~10× faster** than `paddle` with better
+output, and falls back rather than failing if the API is unreachable.
+
+Why the split, rather than letting DeepSeek do everything? Because its bounding
+boxes are only approximate. Measured against PaddleOCR-VL's on a real page, its
+boxes disagreed on granularity — it split regions Paddle merged, and flagged a
+tax table as a figure. Cropping from an approximate box risks clipping the
+diagram or keeping the very handwriting you are removing.
+
+`PP-DocLayoutV3` — the detection half of PaddleOCR-VL, without the 0.9B
+recognition model — gives pixel-accurate boxes in **~2.5 s locally, for free**.
+So:
+
+```
+page photo
+   ├─ PP-DocLayoutV3 (local, 2.5 s)  -> pixel-accurate figure boxes -> crop
+   └─ DeepSeek vision (~5 s)         -> markdown with LaTeX, handwriting already removed
+                                          + which question each figure belongs to
+   -> boxes cropped locally, matched to those hints, placed under the question
+```
+
+DeepSeek is asked only *which question each figure belongs to* — a judgement it
+is good at — while the pixels come from the local model.
+
+Measured on the same page, three consecutive runs: **7.6 s, 7.7 s, 9.3 s**, all
+12 questions present every time, tax table intact, and the handwriting
+(`5`, `120`, `157`, `24元`) removed in the same pass — no separate cleanup step
+needed.
+
+Two bonus effects worth knowing:
+
+- **It splits figures PaddleOCR merges.** On the sample page PaddleOCR returned
+  one 480×173 region covering both a cylinder diagram and a bar chart; layout
+  detection returns them as two separate figures.
+- **The DeepSeek cleanup pass becomes optional.** The text already comes back
+  clean, so **✨ Clean up** is only needed if you want a second pass.
+
+Figure placement uses a 0.3 overlap threshold: a weak match leaves the figure
+unplaced (it appears at the end) rather than attaching it to the wrong question,
+and the review screen can fix it by hand.
+
+If the API is down or you would rather stay fully offline, set `OCR_ENGINE=paddle`
+and nothing else changes.
+
 ### Performance
 
 CPU inference is slow and, by default, badly under-uses a modern machine: a
@@ -288,7 +344,8 @@ A single process — no second service to keep alive.
 app/
   main.py            FastAPI routes + Jinja templates
   worker.py          FIFO queue and OCR worker threads
-  ocr.py             PaddleOCR-VL wrapper: resize → predict → extract figures
+  ocr.py             engine dispatch: PaddleOCR-VL, or the hybrid
+  layout.py          PP-DocLayoutV3 wrapper — the figure boxes, ~2.5 s locally
   markdown_utils.py  normalisation, figure refs, question labelling, merging
   image_host.py      imgbb / local / base64 hosting with a per-task URL cache
   deepseek.py        optional cleanup pass (handwriting removal), figure-safe

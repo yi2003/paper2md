@@ -84,6 +84,26 @@ OCR_PIPELINE_VERSION = _str("OCR_PIPELINE_VERSION", "v1.6")
 OCR_DEBUG = _bool("OCR_DEBUG", False)
 
 # --------------------------------------------------------------------------
+# Which engine reads a page
+# --------------------------------------------------------------------------
+#
+#   paddle   - PaddleOCR-VL end to end (local, free, offline; ~90-130 s a page)
+#   deepseek - local layout detection for the figure boxes (~3.5 s) plus
+#              DeepSeek vision for the text (~60 s). Better LaTeX, and the
+#              handwriting goes in the same pass, but it needs the API.
+#   auto     - try DeepSeek, fall back to Paddle if it fails.
+
+OCR_ENGINE = _str("OCR_ENGINE", "paddle").lower()
+
+# PP-DocLayoutV3 is the layout half of PaddleOCR-VL, used by the deepseek engine.
+LAYOUT_MODEL_NAME = _str("LAYOUT_MODEL_NAME", "PP-DocLayoutV3")
+LAYOUT_MIN_SCORE = float(_str("LAYOUT_MIN_SCORE", "0.5"))
+# Ignore slivers: a "figure" smaller than this is almost certainly a stray mark.
+LAYOUT_MIN_PIXELS = _int("LAYOUT_MIN_PIXELS", 32)
+# Margin added around each cropped figure so nothing gets clipped.
+LAYOUT_PADDING = _int("LAYOUT_PADDING", 6)
+
+# --------------------------------------------------------------------------
 # DeepSeek — turns raw OCR into a clean, question-only paper
 # --------------------------------------------------------------------------
 
