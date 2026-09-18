@@ -161,6 +161,26 @@ Progress therefore counts the streamed `reasoning_content` as well as `content`,
 and maps it through a soft curve that approaches — but never claims — completion.
 Without that, the bar would sit at 0% for the whole thinking phase.
 
+**Should the page photo be sent to DeepSeek too?** Measured: no. `deepseek-flash`
+does accept images (it read a test number out of one), but on a handwriting-heavy
+page the image pass cost **2x the prompt tokens** and was *less* accurate:
+
+```
+text-only  : （1）请用文字补全上述规律：\underline{\hspace{2em}}
+text+image : （1）请用文字补全上述规律：把一个两位数的十位数字和个位数字交换位置，原来两位数与新的两位数的差是\underline{\hspace{2em}}
+```
+
+The student's answer was correctly removed in the first case and left in as if it
+were printed in the second. The text-only pass already has the cue it needs —
+text sitting after a "complete the following:" colon is almost certainly the
+answer — and PaddleOCR-VL has already done the visual work at full resolution
+(3072x4096), while an image attached to the cleanup call has to be downscaled to
+roughly 1050x1400 to keep the request reasonable.
+
+Re-run it on your own pages with `tools/image_vs_text.py <task_id> <page_index>`,
+which does both passes and diffs them. Two pages is a small sample: on a page
+where the OCR text is badly garbled, the photo may well help.
+
 ### Performance
 
 CPU inference is slow and, by default, badly under-uses a modern machine: a
