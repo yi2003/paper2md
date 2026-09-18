@@ -252,7 +252,10 @@ async function saveMapping({ immediate = false } = {}) {
 function boxFromName(name) {
   const match = name.match(/box_(\d+)_(\d+)_(\d+)_(\d+)/);
   if (!match) return null;
-  return { y1: +match[1], x1: +match[2], y2: +match[3], x2: +match[4] };
+  // PaddleOCR names these img_in_image_box_X1_Y1_X2_Y2, in the coordinate space
+  // of the downscaled image it processed. Verified against the saved figure
+  // pixels: (x1,y1,x2,y2) correlates 0.99, the swapped reading correlates 0.04.
+  return { x1: +match[1], y1: +match[2], x2: +match[3], y2: +match[4] };
 }
 
 function setMapping(map) {
