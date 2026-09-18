@@ -6,26 +6,27 @@ on a machine where Paddle is not installed yet.
 """
 
 import io
-import os
 import sys
-import tempfile
 import time
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
+HERE = Path(__file__).resolve().parent
+ROOT = HERE.parent
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(HERE))
 
-# Configure an isolated data directory *before* importing the app.
-_TMP = tempfile.mkdtemp(prefix="paper2md-test-")
-os.environ["DATA_DIR"] = _TMP
-os.environ["IMAGE_HOST"] = "base64"
-os.environ["IMGBB_API_KEY"] = ""
-os.environ["OCR_WORKERS"] = "1"
+# Isolate the data directory *before* `app.config` is imported.
+import _env  # noqa: E402
 
 from fastapi.testclient import TestClient  # noqa: E402
 
-from app import ocr  # noqa: E402
+from app import config, ocr  # noqa: E402
 from app.main import app  # noqa: E402
+
+# Guard against this suite ever running on the real database again.
+assert "paper2md-test-" in str(config.DATA_DIR), (
+    f"tests must use a throwaway DATA_DIR, got {config.DATA_DIR}"
+)
 
 PAGE_MARKDOWN = """1. Simplify the expression.
 
@@ -59,6 +60,12 @@ def _fake_run_ocr(image_path, work_dir, images_dir, prefix=""):
 
 
 ocr.run_ocr = _fake_run_ocr
+
+
+def test_suite_uses_a_throwaway_data_directory():
+    """Guards against the suite ever being pointed at the real database."""
+    assert "paper2md-test-" in str(config.DATA_DIR), config.DATA_DIR
+    assert config.DATA_DIR.is_dir()
 
 
 def _wait(client, task_id, timeout=20.0):

@@ -32,12 +32,14 @@ TASK_FAILED = "failed"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tasks (
-    id              TEXT PRIMARY KEY,
-    title           TEXT NOT NULL DEFAULT '',
-    status          TEXT NOT NULL DEFAULT 'queued',
-    merged_markdown TEXT,
-    created_at      REAL NOT NULL,
-    updated_at      REAL NOT NULL
+    id                TEXT PRIMARY KEY,
+    title             TEXT NOT NULL DEFAULT '',
+    status            TEXT NOT NULL DEFAULT 'queued',
+    merged_markdown   TEXT,
+    polished_markdown TEXT,
+    polish_info       TEXT,
+    created_at        REAL NOT NULL,
+    updated_at        REAL NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS pages (
@@ -84,7 +86,19 @@ def init() -> None:
         _conn.execute("PRAGMA journal_mode=WAL")
         _conn.execute("PRAGMA synchronous=NORMAL")
         _conn.executescript(SCHEMA)
+        _migrate(_conn)
         _conn.commit()
+
+
+def _migrate(connection: sqlite3.Connection) -> None:
+    """Add columns that were introduced after a database was first created."""
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(tasks)")}
+    for name, ddl in (
+        ("polished_markdown", "ALTER TABLE tasks ADD COLUMN polished_markdown TEXT"),
+        ("polish_info", "ALTER TABLE tasks ADD COLUMN polish_info TEXT"),
+    ):
+        if name not in columns:
+            connection.execute(ddl)
 
 
 def close() -> None:
@@ -272,6 +286,42 @@ def rebuild_task(task_id: str) -> dict[str, Any] | None:
     task["status"] = status
     task["merged_markdown"] = merged
     return task
+
+
+# --- DeepSeek cleanup result -------------------------------------------------
+
+
+def set_polished_markdown(
+    task_id: str, markdown: str, info: dict[str, Any] | None = None
+) -> None:
+    _execute(
+        "UPDATE tasks SET polished_markdown = ?, polish_info = ?, updated_at = ? WHERE id = ?",
+        (markdown, json.dumps(info, ensure_ascii=False) if info else None, time.time(), task_id),
+    )
+
+
+def get_polished_markdown(task_id: str) -> tuple[str | None, dict[str, Any] | None]:
+    """Return ``(cleaned_markdown, info)``; both None when it has not been run."""
+    row = _query_one(
+        "SELECT polished_markdown, polish_info FROM tasks WHERE id = ?", (task_id,)
+    )
+    if row is None or not row["polished_markdown"]:
+        return None, None
+    info: dict[str, Any] | None = None
+    if row["polish_info"]:
+        try:
+            info = json.loads(row["polish_info"])
+        except json.JSONDecodeError:
+            info = None
+    return row["polished_markdown"], info
+
+
+def clear_polished_markdown(task_id: str) -> None:
+    """Drop the cleaned version — the pages or the mapping have changed."""
+    _execute(
+        "UPDATE tasks SET polished_markdown = NULL, polish_info = NULL, updated_at = ? WHERE id = ?",
+        (time.time(), task_id),
+    )
 
 
 # --- image hosting cache -----------------------------------------------------

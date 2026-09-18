@@ -55,7 +55,14 @@ To try it immediately there is a ready-made exam page in
      and the preview re-renders with the figure sitting under its question.
 4. **Upload figures** — sends the figures to the image host and shows the exact
    final markdown, so you can check the links before downloading.
-5. **Download** — the whole paper as `.md`, or a single page if you prefer.
+5. **Clean up** *(optional)* — photos of a used paper contain the student's
+   handwritten answers, and the OCR reads them as if they were part of the text
+   (`则 $x+y=\underline{5}$`, `圆心角是 120 度`). With a DeepSeek key configured,
+   **✨ Clean up** sends the paper to DeepSeek and returns the printed questions
+   only, with the handwriting turned back into blank answer slots — see
+   [DeepSeek cleanup](#deepseek-cleanup).
+6. **Download** — the whole paper as `.md`, or a single page. Once cleaned, a
+   **Cleaned .md** button appears alongside it; the original is always kept.
 
 Figures the model found are copied into the markdown as
 `*[Q13 附图]*` immediately followed by the image, so a reader can always tell
@@ -96,6 +103,46 @@ machine running the app.
 | `OCR_ENABLE_MKLDNN` | `0` | oneDNN acceleration; measured *slower* here, leave off. |
 | `OCR_PIPELINE_VERSION` | `v1.6` | PaddleOCR-VL pipeline version. |
 | `OCR_DEBUG` | `0` | Print full tracebacks for failed pages. |
+
+### DeepSeek cleanup
+
+An optional final pass that turns raw OCR into a blank, question-only paper.
+
+```bash
+DEEPSEEK_API_KEY=sk-...        # https://platform.deepseek.com/
+DEEPSEEK_MODEL=deepseek-flash  # checked against GET /models on first use
+```
+
+**Removes** — answers written into blanks, filled-in values, circled options,
+working and margin notes. Blanks come back as `\underline{\hspace{2em}}`, so the
+paper is answerable again.
+
+**Keeps** — printed question stems, options, section headings, marks, all LaTeX,
+and every figure. Question numbering is never changed.
+
+**How the figures survive an LLM.** Asking a chat model to re-emit
+`<img src="https://i.ibb.co/...">` is asking for a corrupted URL. So each figure
+is swapped for an opaque marker before the call — `[[FIG3-Q13]]`, "figure 3
+belongs to question 13" — and swapped back afterwards. The `*[Q13 附图]*` label
+is folded into the marker, so the model cannot reattach a figure to the wrong
+question. Anything the model drops is re-attached at the end rather than lost,
+and the task page reports how many were recovered.
+
+On a real 4-page paper the cleanup removed **30% of the text** (all handwriting)
+while keeping **24 of 24 questions and 7 of 7 figures**.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `DEEPSEEK_API_KEY` | *(empty)* | Unset disables the feature and hides the button. |
+| `DEEPSEEK_MODEL` | `deepseek-flash` | Falls back to `DEEPSEEK_FALLBACK_MODEL` when unavailable. |
+| `DEEPSEEK_MAX_CHARS` | `24000` | Longer papers are cleaned page by page. |
+| `DEEPSEEK_TIMEOUT` | `600` | Seconds per API call. |
+
+Cleaned output is cached per task and **invalidated automatically** whenever a
+figure mapping changes, a page is retried, or more pages are uploaded.
+
+Best results come from setting the figure → question mapping **before** cleaning,
+so each figure carries its question number into the cleanup.
 
 ### Performance
 
@@ -169,9 +216,11 @@ app/
   ocr.py             PaddleOCR-VL wrapper: resize → predict → extract figures
   markdown_utils.py  normalisation, figure refs, question labelling, merging
   image_host.py      imgbb / local / base64 hosting with a per-task URL cache
-  store.py           SQLite: tasks, pages, hosted-image URLs
+  deepseek.py        optional cleanup pass (handwriting removal), figure-safe
+  store.py           SQLite: tasks, pages, hosted-image URLs, cleaned markdown
 templates/           index (upload), task (progress), edit (figure → question)
 static/              app.css, app.js, vendored marked + KaTeX (works offline)
+tools/               bench.py, concurrency.py, compare_polish.py
 data/                runtime: paper2md.db, uploads/<task>/{pages,images}
 ```
 

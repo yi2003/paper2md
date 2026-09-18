@@ -15,6 +15,15 @@
     {% if task.status in ('done', 'partial') %}
     <a class="btn primary" href="/tasks/{{ task.id }}/edit?page=0">Review figures →</a>
     {% endif %}
+    {% if deepseek_ready and all_pages_done %}
+    <button id="polishBtn"
+            title="Send the whole paper to DeepSeek to strip handwritten answers and keep only the questions">
+      ✨ Clean up ({{ deepseek_model }})
+    </button>
+    {% endif %}
+    {% if polish_info %}
+    <a class="btn" href="/tasks/{{ task.id }}/download?variant=polished">Cleaned .md</a>
+    {% endif %}
     <a class="btn" href="/tasks/{{ task.id }}/download">Download .md</a>
     <button class="danger" id="deleteTask">Delete</button>
   </div>
@@ -22,6 +31,11 @@
     Task <span class="mono">{{ task.id }}</span> ·
     <span id="progressText">{{ task.pages | selectattr('status', 'equalto', 'done') | list | length }} / {{ task.pages | length }} pages finished</span>
     · <span id="queueText"></span>
+    {% if polish_info %}
+    · <span style="color:var(--ok)">cleaned with {{ polish_info.model }}
+      · {{ polish_info.chunks }} chunk(s) · {{ polish_info.figures_total }} figure(s)
+      {%- if polish_info.figures_recovered %} · {{ polish_info.figures_recovered }} figure(s) recovered{% endif %}</span>
+    {% endif %}
   </p>
 
   <div class="row" style="margin-top:6px">
@@ -174,6 +188,25 @@ document.getElementById("deleteTask").addEventListener("click", async () => {
     toast(error.message, true);
   }
 });
+
+const polishBtn = document.getElementById("polishBtn");
+if (polishBtn) {
+  polishBtn.addEventListener("click", async () => {
+    const original = polishBtn.textContent;
+    polishBtn.disabled = true;
+    polishBtn.textContent = "Cleaning up with DeepSeek… (can take a minute)";
+    try {
+      const result = await api(`/api/tasks/${TASK_ID}/polish`, { method: "POST" });
+      const info = result.info || {};
+      toast(`Cleaned with ${info.model}: ${info.chunks} chunk(s), ${info.figures_total} figure(s)`);
+      window.location.reload();
+    } catch (error) {
+      toast(error.message, true);
+      polishBtn.disabled = false;
+      polishBtn.textContent = original;
+    }
+  });
+}
 
 pollTimer = setInterval(refresh, 2500);
 refresh();

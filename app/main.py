@@ -19,7 +19,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTex
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from . import config, image_host, store
+from . import config, deepseek, image_host, store
 from .markdown_utils import (
     detect_questions,
     extract_filenames,
@@ -167,7 +167,18 @@ async def page_task(request: Request, task_id: str):
     task = _task_or_404(task_id)
     store.rebuild_task(task_id)
     task = _task_or_404(task_id)
-    return TEMPLATES.TemplateResponse(request, "task.html", {"task": task})
+    _, polish_info = store.get_polished_markdown(task_id)
+    return TEMPLATES.TemplateResponse(
+        request,
+        "task.html",
+        {
+            "task": task,
+            "deepseek_ready": config.deepseek_ready(),
+            "deepseek_model": config.DEEPSEEK_MODEL,
+            "polish_info": polish_info,
+            "all_pages_done": bool(task["pages"]) and all(p["status"] == store.DONE for p in task["pages"]),
+        },
+    )
 
 
 @app.get("/tasks/{task_id}/edit", response_class=HTMLResponse)
@@ -182,6 +193,7 @@ async def page_edit(request: Request, task_id: str, page: int = 0):
     if current["status"] != store.DONE:
         raise HTTPException(400, f"Page {page + 1} is not ready yet ({current['status']})")
 
+    _, polish_info = store.get_polished_markdown(task_id)
     return TEMPLATES.TemplateResponse(
         request,
         "edit.html",
@@ -190,6 +202,10 @@ async def page_edit(request: Request, task_id: str, page: int = 0):
             "page_index": page,
             "page_count": len(task["pages"]),
             "image_host": config.IMAGE_HOST,
+            "deepseek_ready": config.deepseek_ready(),
+            "deepseek_model": config.DEEPSEEK_MODEL,
+            "polish_info": polish_info,
+            "all_pages_done": all(p["status"] == store.DONE for p in task["pages"]),
         },
     )
 
@@ -286,6 +302,7 @@ async def api_upload_pages(task_id: str, files: list[UploadFile] = File(...)):
         index += 1
 
     store.rebuild_task(task_id)
+    store.clear_polished_markdown(task_id)  # new pages invalidate the cleaned paper
     return JSONResponse(
         {
             "task_id": task_id,
@@ -310,6 +327,7 @@ async def api_retry_page(task_id: str, page_index: int):
     store.reset_page_to_queued(task_id, page_index)
     worker.submit(task_id, page_index, image_path)
     store.rebuild_task(task_id)
+    store.clear_polished_markdown(task_id)
     return {"page_index": page_index, "status": store.QUEUED}
 
 
@@ -349,6 +367,7 @@ async def api_save_mapping(
 
     store.set_page_mapping(task_id, page_index, mapping)
     store.rebuild_task(task_id)
+    store.clear_polished_markdown(task_id)  # the cleaned paper is now stale
 
     return {
         "page_index": page_index,
@@ -376,26 +395,79 @@ async def api_host_images(task_id: str):
 
 
 @app.get("/api/tasks/{task_id}/markdown")
-async def api_task_markdown(task_id: str, host: bool = False):
+async def api_task_markdown(task_id: str, host: bool = False, variant: str = "original"):
     task = store.rebuild_task(task_id)
     if task is None:
         raise HTTPException(404, "No such task")
+
+    if variant == "polished":
+        polished, info = store.get_polished_markdown(task_id)
+        if polished is None:
+            raise HTTPException(404, "This task has not been cleaned up with DeepSeek yet")
+        return {"markdown": polished, "info": info, "variant": "polished"}
+
     markdown = task["merged_markdown"] or ""
     if host:
         markdown, _ = await asyncio.to_thread(image_host.host_markdown, markdown, task_id)
-    return {"markdown": markdown}
+    return {"markdown": markdown, "variant": "original"}
+
+
+@app.post("/api/tasks/{task_id}/polish")
+async def api_polish(task_id: str):
+    """Send the merged paper to DeepSeek and store a question-only version.
+
+    Figures are hosted first so the cleaned paper references permanent URLs,
+    then the whole document is sent for cleanup in one or more chunks.
+    """
+    task = store.rebuild_task(task_id)
+    if task is None:
+        raise HTTPException(404, "No such task")
+    if not config.deepseek_ready():
+        raise HTTPException(
+            400, "DEEPSEEK_API_KEY is not set — add it to .env and restart the app"
+        )
+
+    markdown = task["merged_markdown"] or ""
+    if not markdown.strip():
+        raise HTTPException(400, "There is nothing to clean up yet")
+
+    # Host figures so the cleaned paper is portable.
+    markdown, _ = await asyncio.to_thread(image_host.host_markdown, markdown, task_id)
+
+    try:
+        cleaned, info = await asyncio.to_thread(deepseek.polish_markdown, markdown)
+    except deepseek.DeepSeekError as exc:
+        raise HTTPException(502, f"DeepSeek cleanup failed: {exc}") from exc
+
+    store.set_polished_markdown(task_id, cleaned, info)
+    log(f"[{task_id}] cleaned with {info.get('model')}: "
+        f"{len(markdown):,} -> {len(cleaned):,} chars, {info.get('figures_total', 0)} figure(s)")
+
+    return {"markdown": cleaned, "info": info, "variant": "polished"}
 
 
 @app.get("/tasks/{task_id}/download")
-async def download_task(task_id: str, inline: bool = False):
-    """Download the merged markdown, with figures hosted per IMAGE_HOST."""
+async def download_task(task_id: str, inline: bool = False, variant: str = "original"):
+    """Download the merged markdown, with figures hosted per IMAGE_HOST.
+
+    ``variant=polished`` returns the DeepSeek-cleaned paper instead.
+    """
     task = store.rebuild_task(task_id)
     if task is None:
         raise HTTPException(404, "No such task")
 
-    markdown, _ = await asyncio.to_thread(
-        image_host.host_markdown, task["merged_markdown"] or "", task_id
-    )
+    if variant == "polished":
+        markdown, _ = store.get_polished_markdown(task_id)
+        if markdown is None:
+            raise HTTPException(
+                400, "This task has not been cleaned up yet — run 'Clean up with DeepSeek' first"
+            )
+        suffix = "_cleaned"
+    else:
+        markdown, _ = await asyncio.to_thread(
+            image_host.host_markdown, task["merged_markdown"] or "", task_id
+        )
+        suffix = ""
 
     if inline:
         return PlainTextResponse(markdown, media_type="text/plain; charset=utf-8")
@@ -404,7 +476,7 @@ async def download_task(task_id: str, inline: bool = False):
     return PlainTextResponse(
         markdown,
         media_type="text/markdown; charset=utf-8",
-        headers=_attachment(f"{name}.md"),
+        headers=_attachment(f"{name}{suffix}.md"),
     )
 
 
@@ -460,4 +532,6 @@ async def health():
         "ocr_workers": config.OCR_WORKERS,
         "image_host": config.IMAGE_HOST,
         "imgbb_configured": bool(config.IMGBB_API_KEY),
+        "deepseek_configured": config.deepseek_ready(),
+        "deepseek_model": config.DEEPSEEK_MODEL,
     }

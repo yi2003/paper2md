@@ -84,6 +84,25 @@ OCR_PIPELINE_VERSION = _str("OCR_PIPELINE_VERSION", "v1.6")
 OCR_DEBUG = _bool("OCR_DEBUG", False)
 
 # --------------------------------------------------------------------------
+# DeepSeek — turns raw OCR into a clean, question-only paper
+# --------------------------------------------------------------------------
+
+DEEPSEEK_API_KEY = _str("DEEPSEEK_API_KEY", "")
+DEEPSEEK_BASE_URL = _str("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1").rstrip("/")
+# Verified against GET /models on first use; if the account does not offer it we
+# fall back to DEEPSEEK_FALLBACK_MODEL rather than failing.
+DEEPSEEK_MODEL = _str("DEEPSEEK_MODEL", "deepseek-flash")
+DEEPSEEK_FALLBACK_MODEL = _str("DEEPSEEK_FALLBACK_MODEL", "deepseek-chat")
+DEEPSEEK_TIMEOUT = _int("DEEPSEEK_TIMEOUT", 600)
+# Anything longer than this is cleaned page by page rather than in one call.
+DEEPSEEK_MAX_CHARS = _int("DEEPSEEK_MAX_CHARS", 24000)
+
+
+def deepseek_ready() -> bool:
+    """True when an API key is configured."""
+    return bool(DEEPSEEK_API_KEY)
+
+# --------------------------------------------------------------------------
 # Image hosting
 # --------------------------------------------------------------------------
 

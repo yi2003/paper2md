@@ -14,7 +14,10 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 sys.path.insert(0, str(HERE))
 
-MODULES = ["test_markdown", "test_flow"]
+# Must happen before any test module imports `app.config`.
+import _env  # noqa: E402
+
+MODULES = ["test_markdown", "test_deepseek", "test_flow"]
 
 
 def main() -> int:

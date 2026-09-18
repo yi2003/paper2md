@@ -30,6 +30,15 @@
   <button id="hostBtn" title="Upload every figure to the image host and show the final markdown">
     Upload figures ({{ image_host }})
   </button>
+  {% if deepseek_ready and all_pages_done %}
+  <button id="polishBtn"
+          title="Send the whole paper to DeepSeek: removes handwritten answers and keeps only questions with their figures">
+    ✨ Clean up ({{ deepseek_model }})
+  </button>
+  {% endif %}
+  {% if polish_info %}
+  <a class="btn" href="/tasks/{{ task.id }}/download?variant=polished">Cleaned .md</a>
+  {% endif %}
   <a class="btn" href="/tasks/{{ task.id }}/pages/{{ page_index }}/download">Page .md</a>
   <a class="btn primary" href="/tasks/{{ task.id }}/download">Whole paper .md</a>
 </div>
@@ -295,6 +304,31 @@ document.getElementById("hostBtn").addEventListener("click", async (event) => {
     button.textContent = original;
   }
 });
+
+const polishBtn = document.getElementById("polishBtn");
+if (polishBtn) {
+  polishBtn.addEventListener("click", async () => {
+    const original = polishBtn.textContent;
+    polishBtn.disabled = true;
+    polishBtn.textContent = "Cleaning up with DeepSeek…";
+    try {
+      // Make sure the mapping on screen is what gets cleaned.
+      await saveMapping({ immediate: true });
+      const result = await api(`/api/tasks/${TASK_ID}/polish`, { method: "POST" });
+      const info = result.info || {};
+      showMarkdown(result.markdown);
+      document.getElementById("previewTitle").textContent = "Cleaned paper (all pages)";
+      document.getElementById("previewNote").textContent =
+        `${info.model} · ${info.chunks} chunk(s) · ${info.figures_total} figure(s)`;
+      toast("Cleaned — use “Cleaned .md” to download it");
+    } catch (error) {
+      toast(error.message, true);
+    } finally {
+      polishBtn.disabled = false;
+      polishBtn.textContent = original;
+    }
+  });
+}
 
 loadPage().catch((error) => toast(error.message, true));
 
