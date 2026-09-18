@@ -343,6 +343,14 @@ async function pollPolish() {
     hideWhenDone: false,
   });
 
+  // Derived from the polled state on every tick, so a failure or an
+  // interruption can never leave the button disabled.
+  const running = state.status === "running";
+  if (polishBtn) {
+    polishBtn.disabled = running;
+    polishBtn.textContent = running ? "Cleaning up…" : "✨ Clean up";
+  }
+
   if (state.status === "done") {
     stopPolling();
     showMarkdown(state.markdown);
@@ -351,11 +359,9 @@ async function pollPolish() {
     document.getElementById("previewNote").textContent =
       `${info.model} · ${info.chunks} chunk(s) · ${info.figures_total} figure(s)`;
     addCleanedLink();
-    resetPolishButton();
     toast("Cleaned — download it with “Cleaned .md”");
   } else if (state.status === "failed") {
     stopPolling();
-    resetPolishButton();
   }
 }
 

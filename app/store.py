@@ -106,6 +106,14 @@ def _migrate(connection: sqlite3.Connection) -> None:
         if name not in columns:
             connection.execute(ddl)
 
+    # Tasks cleaned before polish_status existed took the column default
+    # ('idle'), which understates reality: a stored cleaned paper means done.
+    connection.execute(
+        "UPDATE tasks SET polish_status = ? "
+        "WHERE polished_markdown IS NOT NULL AND polish_status = ?",
+        (POLISH_DONE, POLISH_IDLE),
+    )
+
 
 def close() -> None:
     global _conn

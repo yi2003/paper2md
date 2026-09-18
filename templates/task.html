@@ -192,12 +192,13 @@ async function refresh() {
   previousPolishStatus = polishStatus;
 
   const polishing = polishStatus === "running";
-  if (polishing) {
-    const button = document.getElementById("polishBtn");
-    if (button) {
-      button.disabled = true;
-      button.textContent = "Cleaning up…";
-    }
+  // Derive the button from the polled state every time, so it can never get
+  // stuck disabled. Relying on a reload to re-enable it meant a cleanup that
+  // failed (or was interrupted by a restart) left the button grey forever.
+  const polishButton = document.getElementById("polishBtn");
+  if (polishButton) {
+    polishButton.disabled = polishing;
+    polishButton.textContent = polishing ? "Cleaning up…" : "✨ Clean up";
   }
 
   // Keep polling while either job is live; stop once everything has settled.

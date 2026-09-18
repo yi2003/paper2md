@@ -304,6 +304,25 @@ def test_polish_state_round_trip():
         assert store.get_polished_markdown(task_id) == (None, None)
 
 
+def test_migration_marks_already_cleaned_tasks_as_done():
+    """Rows cleaned before polish_status existed must not report 'idle'."""
+    from app import store
+
+    with TestClient(app):
+        task_id = store.create_task("legacy")
+        # Simulate the pre-migration row: cleaned paper, default status.
+        store.set_polished_markdown(task_id, "cleaned earlier", {"model": "old"})
+        store._execute(
+            "UPDATE tasks SET polish_status = ? WHERE id = ?", (store.POLISH_IDLE, task_id)
+        )
+        assert store.get_polish_state(task_id)["status"] == store.POLISH_IDLE
+
+        store._migrate(store._conn)
+        assert store.get_polish_state(task_id)["status"] == store.POLISH_DONE
+        # The cleaned paper itself is untouched.
+        assert store.get_polished_markdown(task_id)[0] == "cleaned earlier"
+
+
 def test_stale_running_cleanup_is_reset_on_startup():
     from app import store
 
