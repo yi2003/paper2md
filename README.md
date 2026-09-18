@@ -235,11 +235,24 @@ OCR_ENGINE=auto      # auto | paddle | deepseek
 | engine | how it works | time/page | needs |
 |---|---|---|---|
 | `paddle` | PaddleOCR-VL end to end | ~90–130 s | nothing (local, offline) |
-| `deepseek` | local layout detection for the figure boxes + DeepSeek vision for the text | **~8 s** | DeepSeek API key |
+| `deepseek` | local layout detection for the figure boxes + DeepSeek vision for the text | **~30 s** | DeepSeek API key |
 | `auto` | `deepseek`, falling back to `paddle` if the API or layout model fails | — | key, but degrades safely |
 
-**`auto` is the default.** It measured **~10× faster** than `paddle` with better
+**`auto` is the default.** It measured **~4× faster** than `paddle` with better
 output, and falls back rather than failing if the API is unreachable.
+
+Timing varies a lot with how much the model reasons before answering, and
+reasoning is the dominant cost — it is not the image upload. Measured:
+
+| case | reasoning tokens | time |
+|---|---|---|
+| fresh page, heavy reasoning | 4,563 | 25.6 s |
+| fresh page, very heavy reasoning | ~13,000 | ~64 s |
+| page already processed (re-run) | 235–312 | 7.6–9.3 s |
+
+DeepSeek caches the prompt, so a re-run skips the image prefill (`prompt_cache_hit_tokens`
+goes to 1,152) — but a **new** page is always a cold call and a fresh generation.
+Budget **~30 s per page**, with occasional runs up to a minute.
 
 Why the split, rather than letting DeepSeek do everything? Because its bounding
 boxes are only approximate. Measured against PaddleOCR-VL's on a real page, its
@@ -262,10 +275,9 @@ page photo
 DeepSeek is asked only *which question each figure belongs to* — a judgement it
 is good at — while the pixels come from the local model.
 
-Measured on the same page, three consecutive runs: **7.6 s, 7.7 s, 9.3 s**, all
-12 questions present every time, tax table intact, and the handwriting
-(`5`, `120`, `157`, `24元`) removed in the same pass — no separate cleanup step
-needed.
+Measured on a real page: all 12 questions present, tax table intact, and the
+handwriting (`5`, `120`, `157`, `24元`) removed in the same pass — no separate
+cleanup step needed.
 
 Two bonus effects worth knowing:
 
@@ -281,6 +293,38 @@ and the review screen can fix it by hand.
 
 If the API is down or you would rather stay fully offline, set `OCR_ENGINE=paddle`
 and nothing else changes.
+
+### Could this run on Vercel?
+
+Not with PaddleOCR-VL — it needs 1.9 GB of models and 9.2 GB of RAM, against
+Vercel's 250 MB bundle and 1 GB (Hobby) / 3 GB (Pro) memory limits. But **with
+the DeepSeek engine only**, both of those blockers disappear:
+
+| | with Paddle | DeepSeek only | Vercel limit |
+|---|---|---|---|
+| function bundle | ~1.6 GB | **29.6 MB** | 250 MB |
+| peak memory | 9.2 GB | ~300 MB | 1 GB / 3 GB |
+| time per page | 90–130 s | ~30 s | 60 s Hobby / 300 s Pro |
+
+29.6 MB leaves 8× headroom, and ~30 s fits inside Hobby's 60 s ceiling if you
+process **one page per request**.
+
+What would still have to change is everything that assumed a long-lived process:
+
+1. **Storage.** SQLite and `data/uploads/` have to move to Postgres plus blob
+   storage (Vercel Blob, R2, S3) — the filesystem is read-only except `/tmp`.
+   `store.py` and the image paths are the bulk of the work.
+2. **No background worker.** The OCR queue and worker threads do not survive
+   serverless. Each upload request would process its own page synchronously.
+3. **Figure boxes.** Dropping Paddle means losing PP-DocLayoutV3, so crops would
+   come from DeepSeek's own approximate boxes — noticeably less precise. A
+   hosted layout API would be needed to keep the current quality.
+4. **No offline path.** Every page would depend on the API.
+
+Realistically about a day's work, mostly the storage layer. Worth weighing
+against just running the same app on a small container host (Fly.io, Railway,
+Render, a VPS): with Paddle gone it needs only ~300 MB of RAM, so even a cheap
+instance would do, and the code runs unchanged.
 
 ### Performance
 
