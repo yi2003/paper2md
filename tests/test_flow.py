@@ -7,6 +7,7 @@ on a machine where Paddle is not installed yet.
 
 import io
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -262,3 +263,140 @@ def test_local_and_base64_host_modes():
     markdown = '<img src="images/p1_a.jpg">'
     local = image_host.local_urls(markdown, "t-abc")
     assert local == '<img src="http://localhost:8000/tasks/t-abc/images/p1_a.jpg">'
+
+
+# --- DeepSeek cleanup: background job + progress -----------------------------
+
+
+def _make_ready_task(client, title="polish"):
+    task_id = client.post("/api/tasks", json={"title": title}).json()["task_id"]
+    client.post(
+        f"/api/tasks/{task_id}/pages",
+        files=[("files", ("p.jpg", _jpeg("p"), "image/jpeg"))],
+    )
+    _wait(client, task_id)
+    return task_id
+
+
+def test_polish_state_round_trip():
+    from app import store
+
+    # TestClient runs the lifespan, which is what opens the database.
+    with TestClient(app):
+        task_id = store.create_task("state")
+        assert store.get_polish_state(task_id)["status"] == store.POLISH_IDLE
+
+        store.set_polish_state(task_id, store.POLISH_RUNNING, stage="cleaning", done=2, total=5)
+        state = store.get_polish_state(task_id)
+        assert state == {"status": "running", "stage": "cleaning", "done": 2, "total": 5, "error": None}
+
+        store.set_polish_state(task_id, store.POLISH_FAILED, error="boom")
+        state = store.get_polish_state(task_id)
+        assert state["status"] == "failed" and state["error"] == "boom"
+
+        store.set_polished_markdown(task_id, "cleaned", {"model": "fake"})
+        state = store.get_polish_state(task_id)
+        assert state["status"] == "done" and state["error"] is None
+        assert store.get_polished_markdown(task_id)[0] == "cleaned"
+
+        store.clear_polished_markdown(task_id)
+        assert store.get_polish_state(task_id)["status"] == store.POLISH_IDLE
+        assert store.get_polished_markdown(task_id) == (None, None)
+
+
+def test_stale_running_cleanup_is_reset_on_startup():
+    from app import store
+
+    with TestClient(app):
+        task_id = store.create_task("stale")
+        store.set_polish_state(task_id, store.POLISH_RUNNING, stage="cleaning", done=1, total=3)
+        assert store.reset_stale_polish_states() >= 1
+        assert store.get_polish_state(task_id)["status"] == store.POLISH_FAILED
+
+
+def test_polish_endpoint_runs_in_background_and_reports_progress():
+    from app import config as app_config
+    from app import deepseek as ds
+
+    original_polish = ds.polish_markdown
+    saved_key = app_config.DEEPSEEK_API_KEY
+    app_config.DEEPSEEK_API_KEY = "test-key"
+
+    release = threading.Event()
+    observed = {}
+
+    def fake_polish(markdown, progress=None):
+        if progress:
+            progress("cleaning", 0, 2)
+        observed["started"] = True
+        release.wait(timeout=10)
+        if progress:
+            progress("cleaning", 2, 2)
+        return "# Cleaned paper\n\n1. A question.\n", {
+            "model": "fake",
+            "chunks": 2,
+            "figures_total": 0,
+            "figures_recovered": 0,
+            "usage": {},
+        }
+
+    ds.polish_markdown = fake_polish
+    try:
+        with TestClient(app) as client:
+            task_id = _make_ready_task(client)
+
+            # Starts immediately with 202 rather than blocking.
+            response = client.post(f"/api/tasks/{task_id}/polish")
+            assert response.status_code == 202, response.text
+
+            # Progress becomes visible while the job is still running.
+            deadline = time.time() + 10
+            state = {}
+            while time.time() < deadline:
+                state = client.get(f"/api/tasks/{task_id}/polish").json()
+                if state["status"] == "running" and state["polish"]["total"] == 2:
+                    break
+                time.sleep(0.05)
+            assert state["status"] == "running", state
+            assert state["polish"]["stage"] == "cleaning"
+            assert state["polish"]["total"] == 2
+
+            # A second concurrent run is refused.
+            assert client.post(f"/api/tasks/{task_id}/polish").status_code == 409
+
+            release.set()
+
+            deadline = time.time() + 15
+            while time.time() < deadline:
+                state = client.get(f"/api/tasks/{task_id}/polish").json()
+                if state["status"] in ("done", "failed"):
+                    break
+                time.sleep(0.05)
+            assert state["status"] == "done", state
+            assert "Cleaned paper" in state["markdown"]
+            assert state["info"]["model"] == "fake"
+
+            # The task status endpoint carries the same state.
+            assert client.get(f"/api/tasks/{task_id}").json()["polish"]["status"] == "done"
+
+            # And the cleaned paper is downloadable.
+            downloaded = client.get(f"/tasks/{task_id}/download?variant=polished")
+            assert downloaded.status_code == 200
+            assert "Cleaned paper" in downloaded.text
+            assert "_cleaned.md" in downloaded.headers["content-disposition"]
+    finally:
+        ds.polish_markdown = original_polish
+        app_config.DEEPSEEK_API_KEY = saved_key
+
+
+def test_polish_requires_a_key():
+    from app import config as app_config
+
+    saved = app_config.DEEPSEEK_API_KEY
+    app_config.DEEPSEEK_API_KEY = ""
+    try:
+        with TestClient(app) as client:
+            task_id = _make_ready_task(client, "no-key")
+            assert client.post(f"/api/tasks/{task_id}/polish").status_code == 400
+    finally:
+        app_config.DEEPSEEK_API_KEY = saved

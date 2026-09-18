@@ -38,6 +38,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     merged_markdown   TEXT,
     polished_markdown TEXT,
     polish_info       TEXT,
+    polish_status     TEXT NOT NULL DEFAULT 'idle',
+    polish_progress   TEXT,
+    polish_error      TEXT,
     created_at        REAL NOT NULL,
     updated_at        REAL NOT NULL
 );
@@ -96,6 +99,9 @@ def _migrate(connection: sqlite3.Connection) -> None:
     for name, ddl in (
         ("polished_markdown", "ALTER TABLE tasks ADD COLUMN polished_markdown TEXT"),
         ("polish_info", "ALTER TABLE tasks ADD COLUMN polish_info TEXT"),
+        ("polish_status", "ALTER TABLE tasks ADD COLUMN polish_status TEXT NOT NULL DEFAULT 'idle'"),
+        ("polish_progress", "ALTER TABLE tasks ADD COLUMN polish_progress TEXT"),
+        ("polish_error", "ALTER TABLE tasks ADD COLUMN polish_error TEXT"),
     ):
         if name not in columns:
             connection.execute(ddl)
@@ -290,14 +296,82 @@ def rebuild_task(task_id: str) -> dict[str, Any] | None:
 
 # --- DeepSeek cleanup result -------------------------------------------------
 
+POLISH_IDLE = "idle"
+POLISH_RUNNING = "running"
+POLISH_DONE = "done"
+POLISH_FAILED = "failed"
+
 
 def set_polished_markdown(
     task_id: str, markdown: str, info: dict[str, Any] | None = None
 ) -> None:
     _execute(
-        "UPDATE tasks SET polished_markdown = ?, polish_info = ?, updated_at = ? WHERE id = ?",
-        (markdown, json.dumps(info, ensure_ascii=False) if info else None, time.time(), task_id),
+        "UPDATE tasks SET polished_markdown = ?, polish_info = ?, polish_status = ?, "
+        "polish_progress = NULL, polish_error = NULL, updated_at = ? WHERE id = ?",
+        (
+            markdown,
+            json.dumps(info, ensure_ascii=False) if info else None,
+            POLISH_DONE,
+            time.time(),
+            task_id,
+        ),
     )
+
+
+def set_polish_state(
+    task_id: str,
+    status: str,
+    *,
+    stage: str | None = None,
+    done: int = 0,
+    total: int = 0,
+    error: str | None = None,
+) -> None:
+    """Record cleanup progress so the UI can poll it."""
+    progress = (
+        json.dumps({"stage": stage, "done": done, "total": total}) if stage else None
+    )
+    _execute(
+        "UPDATE tasks SET polish_status = ?, polish_progress = ?, polish_error = ?, "
+        "updated_at = ? WHERE id = ?",
+        (status, progress, error[:2000] if error else None, time.time(), task_id),
+    )
+
+
+def get_polish_state(task_id: str) -> dict[str, Any]:
+    """Current cleanup state: status, stage, done/total and any error."""
+    row = _query_one(
+        "SELECT polish_status, polish_progress, polish_error FROM tasks WHERE id = ?",
+        (task_id,),
+    )
+    if row is None:
+        return {"status": POLISH_IDLE, "stage": None, "done": 0, "total": 0, "error": None}
+
+    progress: dict[str, Any] = {}
+    if row["polish_progress"]:
+        try:
+            progress = json.loads(row["polish_progress"])
+        except json.JSONDecodeError:
+            progress = {}
+
+    return {
+        "status": row["polish_status"] or POLISH_IDLE,
+        "stage": progress.get("stage"),
+        # `done` can be fractional: a chunk in progress counts as a fraction.
+        "done": round(float(progress.get("done") or 0), 3),
+        "total": int(progress.get("total") or 0),
+        "error": row["polish_error"],
+    }
+
+
+def reset_stale_polish_states() -> int:
+    """Mark cleanups interrupted by a restart as failed, so they can be retried."""
+    stale = _query("SELECT id FROM tasks WHERE polish_status = ?", (POLISH_RUNNING,))
+    for row in stale:
+        set_polish_state(
+            row["id"], POLISH_FAILED, error="interrupted by an app restart — try again"
+        )
+    return len(stale)
 
 
 def get_polished_markdown(task_id: str) -> tuple[str | None, dict[str, Any] | None]:
@@ -319,8 +393,10 @@ def get_polished_markdown(task_id: str) -> tuple[str | None, dict[str, Any] | No
 def clear_polished_markdown(task_id: str) -> None:
     """Drop the cleaned version — the pages or the mapping have changed."""
     _execute(
-        "UPDATE tasks SET polished_markdown = NULL, polish_info = NULL, updated_at = ? WHERE id = ?",
-        (time.time(), task_id),
+        "UPDATE tasks SET polished_markdown = NULL, polish_info = NULL, "
+        "polish_status = ?, polish_progress = NULL, polish_error = NULL, "
+        "updated_at = ? WHERE id = ?",
+        (POLISH_IDLE, time.time(), task_id),
     )
 
 

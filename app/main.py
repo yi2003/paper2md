@@ -19,14 +19,14 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTex
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from . import config, deepseek, image_host, store
+from . import config, image_host, store
 from .markdown_utils import (
     detect_questions,
     extract_filenames,
     page_markdown,
     strip_labels,
 )
-from .worker import worker
+from .worker import polish_runner, worker
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 TEMPLATES = Jinja2Templates(directory=str(BASE_DIR / "templates"))
@@ -56,6 +56,7 @@ def log(message: str) -> None:
 async def lifespan(app: FastAPI):
     config.ensure_dirs()
     store.init()
+    store.reset_stale_polish_states()
     worker.start()
     worker.requeue_interrupted()
     log(f"ready on http://localhost:{config.PORT} (image host: {config.IMAGE_HOST})")
@@ -238,6 +239,7 @@ async def api_task(task_id: str):
         "status": task["status"],
         "pages": [_page_status_payload(page) for page in task["pages"]],
         "queue": worker.pending,
+        "polish": store.get_polish_state(task_id),
     }
 
 
@@ -414,10 +416,11 @@ async def api_task_markdown(task_id: str, host: bool = False, variant: str = "or
 
 @app.post("/api/tasks/{task_id}/polish")
 async def api_polish(task_id: str):
-    """Send the merged paper to DeepSeek and store a question-only version.
+    """Start the DeepSeek cleanup in the background.
 
-    Figures are hosted first so the cleaned paper references permanent URLs,
-    then the whole document is sent for cleanup in one or more chunks.
+    Returns immediately with 202. Poll ``GET /api/tasks/{id}/polish`` (or the
+    task status endpoint) for progress — the job reports each figure it uploads
+    and each chunk it cleans.
     """
     task = store.rebuild_task(task_id)
     if task is None:
@@ -426,24 +429,30 @@ async def api_polish(task_id: str):
         raise HTTPException(
             400, "DEEPSEEK_API_KEY is not set — add it to .env and restart the app"
         )
-
-    markdown = task["merged_markdown"] or ""
-    if not markdown.strip():
+    if not (task["merged_markdown"] or "").strip():
         raise HTTPException(400, "There is nothing to clean up yet")
+    if not polish_runner.start(task_id):
+        raise HTTPException(409, "A cleanup is already running for this task")
 
-    # Host figures so the cleaned paper is portable.
-    markdown, _ = await asyncio.to_thread(image_host.host_markdown, markdown, task_id)
+    return JSONResponse(
+        {"task_id": task_id, "status": store.POLISH_RUNNING, "polish": store.get_polish_state(task_id)},
+        status_code=202,
+    )
 
-    try:
-        cleaned, info = await asyncio.to_thread(deepseek.polish_markdown, markdown)
-    except deepseek.DeepSeekError as exc:
-        raise HTTPException(502, f"DeepSeek cleanup failed: {exc}") from exc
 
-    store.set_polished_markdown(task_id, cleaned, info)
-    log(f"[{task_id}] cleaned with {info.get('model')}: "
-        f"{len(markdown):,} -> {len(cleaned):,} chars, {info.get('figures_total', 0)} figure(s)")
-
-    return {"markdown": cleaned, "info": info, "variant": "polished"}
+@app.get("/api/tasks/{task_id}/polish")
+async def api_polish_status(task_id: str):
+    """Progress of the DeepSeek cleanup — poll this while it runs."""
+    _task_or_404(task_id)
+    state = store.get_polish_state(task_id)
+    if state["status"] == store.POLISH_RUNNING and not polish_runner.is_running(task_id):
+        # The worker thread died without writing a state; do not hang the UI.
+        store.set_polish_state(task_id, store.POLISH_FAILED, error="cleanup stopped unexpectedly")
+        state = store.get_polish_state(task_id)
+    if state["status"] == store.POLISH_DONE:
+        markdown, info = store.get_polished_markdown(task_id)
+        return {"status": state["status"], "polish": state, "info": info, "markdown": markdown}
+    return {"status": state["status"], "polish": state}
 
 
 @app.get("/tasks/{task_id}/download")

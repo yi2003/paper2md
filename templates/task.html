@@ -43,6 +43,9 @@
     <input type="file" id="addPages" accept="image/*" multiple hidden>
     <span class="muted" id="addInfo"></span>
   </div>
+
+  <div id="ocrProgress"></div>
+  <div id="polishProgress"></div>
 </section>
 
 <section class="panel">
@@ -79,6 +82,7 @@
 const TASK_ID = {{ task.id | tojson }};
 const TERMINAL = ["done", "partial", "failed"];
 let pollTimer = null;
+let previousPolishStatus = null;
 
 function renderActions(card, page) {
   const actions = card.querySelector('[data-role="actions"]');
@@ -139,6 +143,7 @@ async function refresh() {
   status.className = `badge ${badgeClass(data.status)}`;
 
   const done = data.pages.filter((page) => page.status === "done").length;
+  const failed = data.pages.filter((page) => page.status === "failed").length;
   document.getElementById("progressText").textContent =
     `${done} / ${data.pages.length} pages finished`;
   document.getElementById("queueText").textContent =
@@ -154,9 +159,52 @@ async function refresh() {
     applyPage(card, page);
   }
 
-  const finished = data.pages.length > 0 &&
-    data.pages.every((page) => TERMINAL.includes(page.status));
-  if (finished && pollTimer) {
+  // Overall OCR progress: settled pages (done + failed) out of the total.
+  const pagesActive = data.pages.some((page) => !TERMINAL.includes(page.status));
+  updateProgress(
+    document.getElementById("ocrProgress"),
+    {
+      status: pagesActive ? "running" : failed ? "failed" : "done",
+      done: done + failed,
+      total: data.pages.length,
+      error: failed && !pagesActive ? `${failed} page(s) failed — retry them below` : null,
+    },
+    { title: "Reading pages", hideWhenDone: true }
+  );
+
+  // DeepSeek cleanup progress.
+  updateProgress(document.getElementById("polishProgress"), data.polish, {
+    title: data.polish && data.polish.stage === "hosting"
+      ? "Uploading figures"
+      : "Cleaning with DeepSeek",
+    hideWhenDone: true,
+  });
+
+  const polishStatus = data.polish ? data.polish.status : "idle";
+  if (previousPolishStatus === "running" && polishStatus === "done") {
+    // Reload once so the server-rendered "Cleaned .md" button appears.
+    window.location.reload();
+    return;
+  }
+  if (previousPolishStatus === "running" && polishStatus === "failed") {
+    toast("Cleanup failed — see the message above", true);
+  }
+  previousPolishStatus = polishStatus;
+
+  const polishing = polishStatus === "running";
+  if (polishing) {
+    const button = document.getElementById("polishBtn");
+    if (button) {
+      button.disabled = true;
+      button.textContent = "Cleaning up…";
+    }
+  }
+
+  // Keep polling while either job is live; stop once everything has settled.
+  const keepPolling = pagesActive || polishing;
+  if (keepPolling && !pollTimer) {
+    pollTimer = setInterval(refresh, 1500);
+  } else if (!keepPolling && pollTimer) {
     clearInterval(pollTimer);
     pollTimer = null;
   }
@@ -192,23 +240,23 @@ document.getElementById("deleteTask").addEventListener("click", async () => {
 const polishBtn = document.getElementById("polishBtn");
 if (polishBtn) {
   polishBtn.addEventListener("click", async () => {
-    const original = polishBtn.textContent;
+    // The request returns straight away; progress comes from polling.
     polishBtn.disabled = true;
-    polishBtn.textContent = "Cleaning up with DeepSeek… (can take a minute)";
+    polishBtn.textContent = "Cleaning up…";
     try {
-      const result = await api(`/api/tasks/${TASK_ID}/polish`, { method: "POST" });
-      const info = result.info || {};
-      toast(`Cleaned with ${info.model}: ${info.chunks} chunk(s), ${info.figures_total} figure(s)`);
-      window.location.reload();
+      await api(`/api/tasks/${TASK_ID}/polish`, { method: "POST" });
+      toast("Cleanup started — progress is shown above");
+      if (!pollTimer) pollTimer = setInterval(refresh, 1500);
+      refresh();
     } catch (error) {
       toast(error.message, true);
       polishBtn.disabled = false;
-      polishBtn.textContent = original;
+      polishBtn.textContent = "✨ Clean up";
     }
   });
 }
 
-pollTimer = setInterval(refresh, 2500);
 refresh();
+if (!pollTimer) pollTimer = setInterval(refresh, 2500);
 </script>
 {% endblock %}

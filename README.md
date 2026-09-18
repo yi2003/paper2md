@@ -64,6 +64,9 @@ To try it immediately there is a ready-made exam page in
 6. **Download** — the whole paper as `.md`, or a single page. Once cleaned, a
    **Cleaned .md** button appears alongside it; the original is always kept.
 
+Both long-running steps show a progress bar: page reading (`n / total` pages)
+and the DeepSeek cleanup (figures uploaded, then cleaning).
+
 Figures the model found are copied into the markdown as
 `*[Q13 附图]*` immediately followed by the image, so a reader can always tell
 which diagram goes with which question.
@@ -143,6 +146,20 @@ figure mapping changes, a page is retried, or more pages are uploaded.
 
 Best results come from setting the figure → question mapping **before** cleaning,
 so each figure carries its question number into the cleanup.
+
+**Progress.** The cleanup runs in the background. `POST /api/tasks/<id>/polish`
+returns `202` immediately and the UI polls `GET /api/tasks/<id>/polish`, so a
+long run never looks like a hung request. The bar has two phases:
+
+1. **Uploading figures** — a real `n / total` count, one step per figure.
+2. **Cleaning with DeepSeek** — driven by the characters the model streams back.
+
+`deepseek-flash` is a *reasoning* model: it can think for a minute or more
+before emitting a single word of the answer (a typical page spent ~90 s thinking
+and ~5 s answering, at 26k completion tokens for 3.4k characters of output).
+Progress therefore counts the streamed `reasoning_content` as well as `content`,
+and maps it through a soft curve that approaches — but never claims — completion.
+Without that, the bar would sit at 0% for the whole thinking phase.
 
 ### Performance
 

@@ -43,6 +43,8 @@
   <a class="btn primary" href="/tasks/{{ task.id }}/download">Whole paper .md</a>
 </div>
 
+<div id="polishProgress"></div>
+
 <div class="editor">
   <section>
     <div class="panel" style="padding:0;overflow:hidden">
@@ -306,28 +308,95 @@ document.getElementById("hostBtn").addEventListener("click", async (event) => {
 });
 
 const polishBtn = document.getElementById("polishBtn");
+const polishProgressEl = document.getElementById("polishProgress");
+let polishTimer = null;
+
+function addCleanedLink() {
+  if (document.getElementById("cleanedLink") || !polishBtn) return;
+  const link = document.createElement("a");
+  link.id = "cleanedLink";
+  link.className = "btn";
+  link.href = `/tasks/${TASK_ID}/download?variant=polished`;
+  link.textContent = "Cleaned .md";
+  polishBtn.parentNode.insertBefore(link, polishBtn.nextSibling);
+}
+
+function resetPolishButton(label) {
+  if (!polishBtn) return;
+  polishBtn.disabled = false;
+  polishBtn.textContent = label || "✨ Clean up";
+}
+
+async function pollPolish() {
+  let state;
+  try {
+    state = await api(`/api/tasks/${TASK_ID}/polish`);
+  } catch (error) {
+    console.warn(error);
+    return;
+  }
+
+  updateProgress(polishProgressEl, state.polish, {
+    title: state.polish && state.polish.stage === "hosting"
+      ? "Uploading figures"
+      : "Cleaning with DeepSeek",
+    hideWhenDone: false,
+  });
+
+  if (state.status === "done") {
+    stopPolling();
+    showMarkdown(state.markdown);
+    document.getElementById("previewTitle").textContent = "Cleaned paper (all pages)";
+    const info = state.info || {};
+    document.getElementById("previewNote").textContent =
+      `${info.model} · ${info.chunks} chunk(s) · ${info.figures_total} figure(s)`;
+    addCleanedLink();
+    resetPolishButton();
+    toast("Cleaned — download it with “Cleaned .md”");
+  } else if (state.status === "failed") {
+    stopPolling();
+    resetPolishButton();
+  }
+}
+
+function stopPolling() {
+  if (polishTimer) {
+    clearInterval(polishTimer);
+    polishTimer = null;
+  }
+}
+
+function startPolling() {
+  if (polishBtn) {
+    polishBtn.disabled = true;
+    polishBtn.textContent = "Cleaning up…";
+  }
+  if (!polishTimer) polishTimer = setInterval(pollPolish, 1200);
+  pollPolish();
+}
+
 if (polishBtn) {
   polishBtn.addEventListener("click", async () => {
-    const original = polishBtn.textContent;
     polishBtn.disabled = true;
-    polishBtn.textContent = "Cleaning up with DeepSeek…";
+    polishBtn.textContent = "Starting…";
     try {
       // Make sure the mapping on screen is what gets cleaned.
       await saveMapping({ immediate: true });
-      const result = await api(`/api/tasks/${TASK_ID}/polish`, { method: "POST" });
-      const info = result.info || {};
-      showMarkdown(result.markdown);
-      document.getElementById("previewTitle").textContent = "Cleaned paper (all pages)";
-      document.getElementById("previewNote").textContent =
-        `${info.model} · ${info.chunks} chunk(s) · ${info.figures_total} figure(s)`;
-      toast("Cleaned — use “Cleaned .md” to download it");
+      await api(`/api/tasks/${TASK_ID}/polish`, { method: "POST" });
+      startPolling();
     } catch (error) {
       toast(error.message, true);
-    } finally {
-      polishBtn.disabled = false;
-      polishBtn.textContent = original;
+      resetPolishButton();
     }
   });
+
+  // A cleanup may already be running (started from the task page, say).
+  api(`/api/tasks/${TASK_ID}/polish`)
+    .then((state) => {
+      if (state.status === "running") startPolling();
+      else if (state.status === "done") addCleanedLink();
+    })
+    .catch(() => {});
 }
 
 loadPage().catch((error) => toast(error.message, true));

@@ -15,9 +15,11 @@ lost.
 
 from __future__ import annotations
 
+import json
+import math
 import re
 import sys
-from typing import Any
+from typing import Any, Callable
 
 import requests
 
@@ -254,7 +256,101 @@ def resolve_model(refresh: bool = False) -> str:
     return _model_cache
 
 
-def _chat(markdown: str, model: str) -> tuple[str, dict[str, int]]:
+def _soft_fraction(streamed_chars: int, expected_chars: int) -> float:
+    """Map streamed characters onto a 0..1 fraction that never quite reaches 1.
+
+    The model's reasoning length is not predictable up front, so a fixed
+    denominator would either stall or jump. This approaches (but never claims)
+    completion, which keeps the bar honest and always moving.
+    """
+    if streamed_chars <= 0 or expected_chars <= 0:
+        return 0.0
+    return min(0.97, 1.0 - math.exp(-streamed_chars / expected_chars))
+
+
+def _chat(
+    markdown: str, model: str, on_chars: Callable[[int], None] | None = None
+) -> tuple[str, dict[str, int]]:
+    """Call the API, streaming so a long cleanup can report progress.
+
+    Falls back to a single blocking request if streaming yields nothing, so a
+    provider or proxy that ignores ``stream`` still works.
+    """
+    payload: dict[str, Any] = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": markdown},
+        ],
+        "temperature": 0,
+        "stream": True,
+        # Ask for a usage block on the final chunk.
+        "stream_options": {"include_usage": True},
+    }
+    parts: list[str] = []
+    received = 0
+    usage: dict[str, int] = {}
+
+    try:
+        with requests.post(
+            f"{config.DEEPSEEK_BASE_URL}/chat/completions",
+            headers=_headers(),
+            json=payload,
+            timeout=config.DEEPSEEK_TIMEOUT,
+            stream=True,
+        ) as response:
+            if response.status_code == 401:
+                raise DeepSeekError("DeepSeek rejected the API key (401 Unauthorized)")
+            if not response.ok:
+                raise DeepSeekError(
+                    f"DeepSeek returned HTTP {response.status_code}: {response.text[:300]}"
+                )
+
+            for line in response.iter_lines(decode_unicode=True):
+                if not line or not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    event = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+                if event.get("usage"):
+                    usage = event["usage"]
+                for choice in event.get("choices") or []:
+                    delta = choice.get("delta") or {}
+                    piece = delta.get("content")
+                    if piece:
+                        parts.append(piece)
+                        received += len(piece)
+                    # deepseek-flash is a reasoning model: it streams
+                    # `reasoning_content` for a long while before any `content`
+                    # arrives. Counting both is what keeps the progress bar
+                    # moving instead of sitting still for a minute.
+                    thinking = delta.get("reasoning_content")
+                    if thinking:
+                        received += len(thinking)
+                    if on_chars is not None and (piece or thinking):
+                        try:
+                            on_chars(received)
+                        except Exception:  # noqa: BLE001, S110 - progress is best-effort
+                            pass
+    except DeepSeekError:
+        raise
+    except requests.RequestException as exc:
+        raise DeepSeekError(f"DeepSeek request failed: {exc}") from exc
+
+    content = "".join(parts).strip()
+    if content:
+        return content, usage
+
+    log("streaming produced nothing; retrying as a single request")
+    return _chat_blocking(markdown, model)
+
+
+def _chat_blocking(markdown: str, model: str) -> tuple[str, dict[str, int]]:
+    """Plain non-streaming request — the fallback path."""
     payload: dict[str, Any] = {
         "model": model,
         "messages": [
@@ -296,11 +392,20 @@ def _chat(markdown: str, model: str) -> tuple[str, dict[str, int]]:
 # --------------------------------------------------------------------------
 
 
-def polish_markdown(markdown: str) -> tuple[str, dict[str, Any]]:
+def polish_markdown(
+    markdown: str,
+    progress: Callable[[str, int, int], None] | None = None,
+) -> tuple[str, dict[str, Any]]:
     """Clean ``markdown`` into a question-only paper.
 
-    Returns ``(cleaned_markdown, info)`` where info carries the model used, token
-    usage and any figures the model dropped.
+    Args:
+        markdown: the paper, with figures already hosted.
+        progress: optional ``progress(stage, done, total)`` callback, called once
+            per chunk so a UI can show a real progress bar.
+
+    Returns:
+        ``(cleaned_markdown, info)`` where info carries the model used, token
+        usage and any figures the model dropped.
     """
     if not config.DEEPSEEK_API_KEY:
         raise DeepSeekError(
@@ -313,27 +418,51 @@ def polish_markdown(markdown: str) -> tuple[str, dict[str, Any]]:
     chunks = split_into_chunks(markdown)
     log(f"cleaning {len(markdown):,} chars in {len(chunks)} chunk(s) with {model}")
 
+    def report(stage: str, done: int, total: int) -> None:
+        if progress is None:
+            return
+        try:
+            progress(stage, done, total)
+        except Exception as exc:  # noqa: BLE001 - progress must never break the job
+            log(f"progress callback failed: {exc}")
+
     cleaned_parts: list[str] = []
     dropped: list[str] = []
+    figures_total = 0
     usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
+    report("cleaning", 0, len(chunks))
     for number, chunk in enumerate(chunks, start=1):
         protected, mapping = protect_figures(chunk)
-        answer, chunk_usage = _chat(protected, model)
+        figures_total += len(mapping)
+
+        # Reasoning tokens dominate the wait, so the budget is generous. The
+        # soft curve keeps the bar moving without ever claiming completion.
+        expected = max(600, len(protected) * 4)
+        base = number - 1
+        chunk_count = len(chunks)
+
+        def on_chars(count: int, base: int = base, expected: int = expected, chunk_count: int = chunk_count) -> None:
+            report("cleaning", base + _soft_fraction(count, expected), chunk_count)
+
+        answer, chunk_usage = _chat(protected, model, on_chars=on_chars)
         restored, missing = restore_figures(answer, mapping)
         restored = _PAGE_MARKER_RE.sub("", restored).strip()
         cleaned_parts.append(restored)
         dropped.extend(missing)
         for key in usage:
             usage[key] += int(chunk_usage.get(key) or 0)
-        log(f"chunk {number}/{len(chunks)}: {len(mapping)} figure(s)"
-            + (f", {len(missing)} recovered after the model dropped them" if missing else ""))
+        log(
+            f"chunk {number}/{chunk_count}: {len(mapping)} figure(s)"
+            + (f", {len(missing)} recovered after the model dropped them" if missing else "")
+        )
+        report("cleaning", number, chunk_count)
 
     info: dict[str, Any] = {
         "model": model,
         "chunks": len(chunks),
         "usage": usage,
-        "figures_total": sum(len(protect_figures(c)[1]) for c in chunks),
+        "figures_total": figures_total,
         "figures_recovered": len(dropped),
     }
     return "\n\n".join(part for part in cleaned_parts if part).strip() + "\n", info

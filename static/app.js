@@ -104,3 +104,66 @@ function triggerDownload(url) {
   document.body.appendChild(frame);
   setTimeout(() => frame.remove(), 60000);
 }
+
+/* ---------------------------------------------------------------- progress */
+
+const STAGE_LABELS = {
+  hosting: "Uploading figures",
+  cleaning: "Cleaning with DeepSeek",
+  done: "Finished",
+};
+
+/**
+ * Draw a progress bar.
+ *
+ * @param {HTMLElement} container element to fill
+ * @param {object} state {status, stage, done, total, error}
+ * @param {object} [opts] {title, detail, hideWhenDone}
+ */
+function updateProgress(container, state, opts = {}) {
+  if (!container) return;
+
+  const idle = !state || state.status === "idle" || state.status === undefined;
+  if (idle || (state.status === "done" && opts.hideWhenDone)) {
+    container.hidden = true;
+    container.innerHTML = "";
+    return;
+  }
+
+  const running = state.status === "running";
+  const failed = state.status === "failed";
+  const finished = state.status === "done";
+  const total = Number(state.total) || 0;
+  // `done` is fractional while a chunk streams, so even a single chunk gives a
+  // meaningful percentage. Only the "N / M" label needs more than one step.
+  const hasCount = total > 0;
+  const percent = finished
+    ? 100
+    : hasCount
+      ? Math.min(100, Math.round((Number(state.done) / total) * 100))
+      : 0;
+
+  // No total at all (e.g. the first figure upload) — sweep rather than fake it.
+  const indeterminate = running && !hasCount;
+  const barClass = finished ? "done" : failed ? "failed" : indeterminate ? "indeterminate" : "";
+
+  const title = opts.title || STAGE_LABELS[state.stage] || "Working…";
+  const detail = opts.detail !== undefined
+    ? opts.detail
+    : total > 1
+      // `done` can be fractional mid-chunk; show whole steps only.
+      ? `${Math.floor(Number(state.done) || 0)} / ${state.total}`
+      : "";
+
+  container.hidden = false;
+  container.innerHTML =
+    '<div class="progress-wrap">' +
+      '<div class="head">' +
+        `<span class="title">${escapeHtml(title)}</span>` +
+        `<span class="detail">${escapeHtml(detail || "")}</span>` +
+        `<span class="pct">${failed ? "" : percent + "%"}</span>` +
+      "</div>" +
+      `<div class="progress ${barClass}"><div class="bar" style="width:${percent}%"></div></div>` +
+      (state.error ? `<div class="progress-error">${escapeHtml(state.error)}</div>` : "") +
+    "</div>";
+}

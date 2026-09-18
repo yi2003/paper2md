@@ -18,6 +18,7 @@ import base64
 import mimetypes
 import sys
 from pathlib import Path
+from typing import Callable
 
 import requests
 
@@ -90,14 +91,30 @@ def local_urls(md: str, task_id: str) -> str:
     return md
 
 
-def host_markdown(md: str, task_id: str) -> tuple[str, dict[str, str]]:
+def host_markdown(
+    md: str, task_id: str, progress: Callable[[int, int], None] | None = None
+) -> tuple[str, dict[str, str]]:
     """Rewrite figure references for the configured host.
 
-    Returns the rewritten markdown and the ``{filename: url}`` map that was used
-    (empty for ``local`` and ``base64`` modes).
+    Args:
+        md: the markdown to rewrite.
+        task_id: which task the figures belong to.
+        progress: optional ``progress(done, total)`` callback, called per figure.
+
+    Returns:
+        The rewritten markdown and the ``{filename: url}`` map that was used
+        (empty for ``local`` and ``base64`` modes).
     """
     if not md:
         return md, {}
+
+    def report(done: int, total: int) -> None:
+        if progress is None:
+            return
+        try:
+            progress(done, total)
+        except Exception as exc:  # noqa: BLE001 - progress must never break hosting
+            log(f"progress callback failed: {exc}")
 
     mode = config.IMAGE_HOST
 
@@ -118,18 +135,24 @@ def host_markdown(md: str, task_id: str) -> tuple[str, dict[str, str]]:
     cached = store.get_image_urls(task_id)
     used: dict[str, str] = {}
 
-    for ref in find_all_image_refs(md):
+    refs = find_all_image_refs(md)
+    total = len(refs)
+    report(0, total)
+
+    for index, ref in enumerate(refs, start=1):
         name = Path(ref).name
 
         url = cached.get(name)
         if url:
             md = _replace(md, ref, url)
             used[name] = url
+            report(index, total)
             continue
 
         path = images_dir / name
         if not path.exists():
             log(f"missing figure, left as-is: {ref}")
+            report(index, total)
             continue
 
         try:
@@ -137,11 +160,13 @@ def host_markdown(md: str, task_id: str) -> tuple[str, dict[str, str]]:
         except (ImageHostError, requests.RequestException, ValueError) as exc:
             log(f"imgbb upload failed for {name} ({exc}); inlining it instead")
             md = _replace(md, ref, _data_uri(path))
+            report(index, total)
             continue
 
         store.save_image_url(task_id, name, url)
         used[name] = url
         md = _replace(md, ref, url)
         log(f"uploaded {name} -> {url}")
+        report(index, total)
 
     return md, used

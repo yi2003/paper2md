@@ -133,3 +133,155 @@ def test_empty_key_raises_a_clear_error():
         raise AssertionError("expected DeepSeekError")
     finally:
         deepseek.config.DEEPSEEK_API_KEY = saved
+
+
+# --- streaming transport (mocked; no network) --------------------------------
+
+
+class _FakeStream:
+    """Stands in for the streamed response from requests.post."""
+
+    def __init__(self, lines, status_code=200):
+        self._lines = lines
+        self.status_code = status_code
+        self.ok = status_code == 200
+        self.text = ""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def iter_lines(self, decode_unicode=False):
+        yield from self._lines
+
+
+def _patch_post(monkeypatch_lines, blocking_body=None, calls=None):
+    def fake_post(url, **kwargs):
+        if calls is not None:
+            calls.append(kwargs)
+        if kwargs.get("stream"):
+            return _FakeStream(monkeypatch_lines)
+        return _FakeBlocking(blocking_body)
+
+    deepseek.requests.post = fake_post
+
+
+class _FakeBlocking:
+    status_code = 200
+    ok = True
+    text = ""
+
+    def __init__(self, body):
+        self._body = body
+
+    def json(self):
+        return self._body
+
+
+def test_chat_streams_and_reports_character_progress():
+    saved = deepseek.requests.post
+    seen: list[int] = []
+    _patch_post(
+        [
+            'data: {"choices":[{"delta":{"content":"Hel"}}]}',
+            'data: {"choices":[{"delta":{"content":"lo"}}]}',
+            'data: {"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":2,"total_tokens":7}}',
+            "data: [DONE]",
+        ]
+    )
+    try:
+        content, usage = deepseek._chat("text", "model", on_chars=seen.append)
+        assert content == "Hello"
+        assert usage["total_tokens"] == 7
+        assert seen == [3, 5]
+    finally:
+        deepseek.requests.post = saved
+
+
+def test_chat_ignores_non_data_and_malformed_lines():
+    saved = deepseek.requests.post
+    _patch_post(
+        [
+            "",
+            ": keep-alive",
+            "data: not json",
+            'data: {"choices":[{"delta":{"content":"x"}}]}',
+            "data: [DONE]",
+        ]
+    )
+    try:
+        content, _ = deepseek._chat("text", "model")
+        assert content == "x"
+    finally:
+        deepseek.requests.post = saved
+
+
+def test_chat_falls_back_to_blocking_when_stream_is_empty():
+    saved = deepseek.requests.post
+    calls: list[dict] = []
+    _patch_post(
+        ["data: [DONE]"],
+        blocking_body={"choices": [{"message": {"content": "from fallback"}}], "usage": {"total_tokens": 3}},
+        calls=calls,
+    )
+    try:
+        content, usage = deepseek._chat("text", "model")
+        assert content == "from fallback"
+        assert usage["total_tokens"] == 3
+        assert len(calls) == 2, "expected a streaming attempt then a blocking retry"
+        assert calls[0].get("stream") is True
+        assert not calls[1].get("stream"), "the retry must not stream"
+    finally:
+        deepseek.requests.post = saved
+
+
+def test_chat_counts_reasoning_content_towards_progress():
+    """deepseek-flash thinks for a long time before emitting answer text."""
+    saved = deepseek.requests.post
+    seen: list[int] = []
+    _patch_post(
+        [
+            'data: {"choices":[{"delta":{"reasoning_content":"thinking hard"}}]}',
+            'data: {"choices":[{"delta":{"reasoning_content":"some more"}}]}',
+            'data: {"choices":[{"delta":{"content":"Answer"}}]}',
+            "data: [DONE]",
+        ]
+    )
+    try:
+        content, _ = deepseek._chat("text", "model", on_chars=seen.append)
+        assert content == "Answer"
+        # Progress advanced during the reasoning phase, not only at the end.
+        assert len(seen) == 3
+        assert seen[0] == len("thinking hard")
+        assert seen[1] == len("thinking hard") + len("some more")
+        assert seen[2] == seen[1] + len("Answer")
+    finally:
+        deepseek.requests.post = saved
+
+
+def test_soft_fraction_is_monotonic_and_never_completes():
+    fractions = [deepseek._soft_fraction(n, 1000) for n in range(0, 6000, 250)]
+    assert fractions[0] == 0.0
+    assert fractions == sorted(fractions), "must never go backwards"
+    assert all(f < 1.0 for f in fractions), "must never claim completion on its own"
+    assert fractions[-1] > 0.9, "should end up near the end"
+    assert deepseek._soft_fraction(0, 0) == 0.0
+
+
+def test_chat_reports_bad_key_clearly():
+    saved = deepseek.requests.post
+
+    def fake_post(url, **kwargs):
+        return _FakeStream([], status_code=401)
+
+    deepseek.requests.post = fake_post
+    try:
+        deepseek._chat("text", "model")
+    except deepseek.DeepSeekError as exc:
+        assert "401" in str(exc)
+    else:
+        raise AssertionError("expected DeepSeekError")
+    finally:
+        deepseek.requests.post = saved

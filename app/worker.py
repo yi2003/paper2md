@@ -1,8 +1,9 @@
-"""Background OCR queue.
+"""Background jobs.
 
-Uploaded pages are queued immediately; a small pool of threads drains the queue
-one page at a time. Every state change is written straight to SQLite so the web
-UI can poll cheaply and survive a restart.
+Pages are queued for OCR as soon as they are uploaded; a small pool of threads
+drains the queue. The DeepSeek cleanup runs the same way. Every state change is
+written straight to SQLite so the web UI can poll cheaply, show progress, and
+survive a restart.
 """
 
 from __future__ import annotations
@@ -14,7 +15,7 @@ import traceback
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import config, ocr, store
+from . import config, deepseek, image_host, ocr, store
 
 
 @dataclass
@@ -130,3 +131,74 @@ class OcrWorker:
 
 
 worker = OcrWorker()
+
+
+class PolishRunner:
+    """Runs the DeepSeek cleanup for a task on a background thread.
+
+    At most one cleanup per task. Progress is written to SQLite after every
+    figure and every chunk, so the web UI can poll it exactly like OCR progress
+    instead of staring at a blocked request.
+    """
+
+    def __init__(self) -> None:
+        self._active: set[str] = set()
+        self._lock = threading.Lock()
+
+    def is_running(self, task_id: str) -> bool:
+        with self._lock:
+            return task_id in self._active
+
+    def start(self, task_id: str) -> bool:
+        """Start a cleanup. Returns False if one is already running."""
+        with self._lock:
+            if task_id in self._active:
+                return False
+            self._active.add(task_id)
+        threading.Thread(
+            target=self._run, args=(task_id,), name=f"polish-{task_id}", daemon=True
+        ).start()
+        return True
+
+    def _run(self, task_id: str) -> None:
+        try:
+            task = store.rebuild_task(task_id)
+            markdown = (task or {}).get("merged_markdown") or ""
+            if not markdown.strip():
+                raise deepseek.DeepSeekError("there is nothing to clean up yet")
+
+            store.set_polish_state(
+                task_id, store.POLISH_RUNNING, stage="hosting", done=0, total=0
+            )
+
+            def on_figures(done: int, total: int) -> None:
+                store.set_polish_state(
+                    task_id, store.POLISH_RUNNING, stage="hosting", done=done, total=total
+                )
+
+            # Host figures first, so the cleaned paper references permanent URLs.
+            markdown, _ = image_host.host_markdown(markdown, task_id, progress=on_figures)
+
+            def on_chunks(stage: str, done: int, total: int) -> None:
+                store.set_polish_state(
+                    task_id, store.POLISH_RUNNING, stage=stage, done=done, total=total
+                )
+
+            cleaned, info = deepseek.polish_markdown(markdown, progress=on_chunks)
+            store.set_polished_markdown(task_id, cleaned, info)
+            ocr.log(
+                f"[{task_id}] cleaned with {info.get('model')}: "
+                f"{len(markdown):,} -> {len(cleaned):,} chars, "
+                f"{info.get('figures_total', 0)} figure(s)"
+            )
+        except Exception as exc:  # noqa: BLE001 - surfaced in the UI
+            if config.OCR_DEBUG:
+                ocr.log(traceback.format_exc())
+            store.set_polish_state(task_id, store.POLISH_FAILED, error=str(exc))
+            ocr.log(f"[{task_id}] cleanup failed: {exc}")
+        finally:
+            with self._lock:
+                self._active.discard(task_id)
+
+
+polish_runner = PolishRunner()
