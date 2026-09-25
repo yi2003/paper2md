@@ -17,7 +17,7 @@ sys.path.insert(0, str(HERE))
 # Must happen before any test module imports `app.config`.
 import _env  # noqa: E402
 
-MODULES = ["test_markdown", "test_deepseek", "test_hybrid", "test_flow"]
+MODULES = ["test_markdown", "test_deepseek", "test_hybrid", "test_flow", "test_pdf"]
 
 
 def main() -> int:

@@ -138,6 +138,7 @@ class OcrWorker:
         finally:
             shutil.rmtree(work_dir, ignore_errors=True)
             store.rebuild_task(job.task_id)
+            maybe_auto_polish(job.task_id)
 
 
 worker = OcrWorker()
@@ -212,3 +213,52 @@ class PolishRunner:
 
 
 polish_runner = PolishRunner()
+
+
+# --------------------------------------------------------------------------
+# Automatic cleanup for PDF tasks
+# --------------------------------------------------------------------------
+#
+# A PDF is supposed to come out as a *clean* paper, so its cleanup does not wait
+# for someone to press ✨ Clean up: once every page has been read successfully,
+# the DeepSeek pass starts on its own. The flag lives on the task (set when a PDF
+# is ingested) rather than on the process, so it survives a restart and photo
+# tasks are unaffected.
+
+
+def maybe_auto_polish(task_id: str) -> bool:
+    """Start the cleanup if this fully-read task asked for it. Idempotent."""
+    if not config.PDF_AUTO_POLISH or not config.deepseek_ready():
+        return False
+    if not store.auto_polish_enabled(task_id):
+        return False
+
+    task = store.get_task(task_id)
+    if task is None or task["status"] != store.TASK_DONE:
+        # Still reading, or a page failed — a half-read paper must not be cleaned.
+        return False
+    if not (task.get("merged_markdown") or "").strip():
+        return False
+    if polish_runner.is_running(task_id):
+        return False
+
+    started = polish_runner.start(task_id)
+    if started:
+        ocr.log(f"[{task_id}] all pages read — auto-cleaning with DeepSeek")
+    return started
+
+
+def auto_polish_pending() -> int:
+    """Re-arm auto-clean for tasks left un-cleaned by a restart.
+
+    Returns how many were started. Safe to call at startup: tasks already
+    cleaned, still reading, or currently cleaning are ignored.
+    """
+    if not config.PDF_AUTO_POLISH or not config.deepseek_ready():
+        return 0
+    started = 0
+    for task_id in store.tasks_awaiting_auto_polish():
+        if polish_runner.start(task_id):
+            ocr.log(f"[{task_id}] auto-clean resumed after restart")
+            started += 1
+    return started

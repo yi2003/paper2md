@@ -29,6 +29,9 @@ def prepare() -> str:
     os.environ["IMGBB_API_KEY"] = ""
     os.environ["DEEPSEEK_API_KEY"] = ""
     os.environ["OCR_WORKERS"] = "1"
+    # Auto-clean is on in production; tests turn it on explicitly so an
+    # unrelated PDF test can never leave a background cleanup running.
+    os.environ["PDF_AUTO_POLISH"] = "0"
     os.environ[_MARKER] = "1"
     return directory
 

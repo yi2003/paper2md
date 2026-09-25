@@ -9,24 +9,26 @@ import asyncio
 import io
 import json
 import re
+import shutil
 import sys
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import quote
 
-from fastapi import Body, FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import Body, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from . import config, deepseek, image_host, store
+from . import config, deepseek, image_host, pdf, store
 from .markdown_utils import (
     detect_questions,
     extract_filenames,
     page_markdown,
     strip_labels,
 )
-from .worker import polish_runner, worker
+from .worker import auto_polish_pending, polish_runner, worker
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 TEMPLATES = Jinja2Templates(directory=str(BASE_DIR / "templates"))
@@ -59,6 +61,7 @@ async def lifespan(app: FastAPI):
     store.reset_stale_polish_states()
     worker.start()
     worker.requeue_interrupted()
+    auto_polish_pending()  # resume PDF cleanups a restart cut short
     log(f"ready on http://localhost:{config.PORT} (image host: {config.IMAGE_HOST})")
     try:
         yield
@@ -143,6 +146,102 @@ def _mapping_of(page: dict) -> dict[str, str]:
         return {}
 
 
+async def _ingest_pdf(task_id: str, upload: UploadFile) -> dict:
+    """Render a PDF into page images and queue them for OCR.
+
+    Shared by ``POST /api/tasks/{id}/pdf`` and the one-shot
+    ``POST /api/convert/pdf``. Rendering is synchronous but fast (pdfium), so it
+    runs in a thread; the OCR itself is queued and reported through the normal
+    per-page status. Nothing here is PDF-specific once the pages are on disk —
+    the pages are byte-for-byte what a photo upload would have produced.
+    """
+    if not pdf.is_available():
+        raise HTTPException(
+            400, "PDF support is not installed — run 'pip install pypdfium2' and restart"
+        )
+
+    name = upload.filename or "document.pdf"
+    if Path(name).suffix.lower() not in config.PDF_SUFFIXES:
+        raise HTTPException(400, f"{name} is not a PDF")
+
+    raw = await upload.read()
+    if not raw:
+        raise HTTPException(400, f"{name} is empty")
+    limit_bytes = config.MAX_PDF_MB * 1024 * 1024
+    if len(raw) > limit_bytes:
+        raise HTTPException(400, f"{name} is larger than {config.MAX_PDF_MB} MB")
+
+    # Keep the original alongside the task, so a page can always be traced back
+    # to the PDF (and page number) it came from.
+    source = config.pdf_dir(task_id) / f"{uuid.uuid4().hex[:8]}_{_safe_filename(name)}"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_bytes(raw)
+
+    first_index = store.next_page_index(task_id)
+    try:
+        result = await asyncio.to_thread(
+            pdf.render_pages,
+            source,
+            config.pages_dir(task_id),
+            first_index=first_index,
+            first_page=config.PDF_FIRST_PAGE,
+            last_page=config.PDF_LAST_PAGE or None,
+        )
+    except pdf.PdfError as exc:
+        source.unlink(missing_ok=True)
+        raise HTTPException(400, str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001 - report, do not leak a traceback
+        source.unlink(missing_ok=True)
+        log(f"[{task_id}] could not render {name}: {exc}")
+        raise HTTPException(500, f"could not render the PDF: {exc}") from exc
+
+    if not result.pages:
+        # Either every page in range was blank, or the range was empty. Keep the
+        # message specific so the user knows which knob to turn.
+        if result.skipped:
+            raise HTTPException(
+                400,
+                f"all {len(result.skipped)} page(s) of {name} look blank — "
+                "set PDF_SKIP_BLANK=0 to read them anyway",
+            )
+        raise HTTPException(400, f"{name} produced no pages")
+
+    accepted: list[dict] = []
+    for page in result.pages:
+        label = f"{name} · p{page.page_number}"
+        store.add_page(task_id, page.page_index, label)
+        worker.submit(task_id, page.page_index, page.path)
+        accepted.append(
+            {
+                "page_index": page.page_index,
+                "pdf_page": page.page_number,
+                "filename": label,
+                "width": page.width,
+                "height": page.height,
+            }
+        )
+
+    store.set_auto_polish(task_id, config.PDF_AUTO_POLISH)
+    store.rebuild_task(task_id)
+    store.clear_polished_markdown(task_id)  # the cleaned paper is now stale
+    log(
+        f"[{task_id}] {name}: queued {len(accepted)} page(s), "
+        f"skipped {len(result.skipped)} blank"
+    )
+
+    return {
+        "task_id": task_id,
+        "source": name,
+        "pdf_pages": result.total_pages,
+        "page_range": [result.first_page, result.last_page],
+        "dpi": result.dpi,
+        "truncated": result.truncated,
+        "accepted": accepted,
+        "queued_pages": len(accepted),
+        "blank_pages": result.blank,
+    }
+
+
 # --------------------------------------------------------------------------
 # HTML pages
 # --------------------------------------------------------------------------
@@ -158,6 +257,8 @@ async def page_home(request: Request):
             "image_host": config.IMAGE_HOST,
             "imgbb_ready": bool(config.IMGBB_API_KEY),
             "max_upload_mb": config.MAX_UPLOAD_MB,
+            "max_pdf_mb": config.MAX_PDF_MB,
+            "pdf_ready": pdf.is_available(),
             "ocr_workers": config.OCR_WORKERS,
         },
     )
@@ -177,6 +278,7 @@ async def page_task(request: Request, task_id: str):
             "deepseek_ready": config.deepseek_ready(),
             "deepseek_model": config.DEEPSEEK_MODEL,
             "polish_info": polish_info,
+            "pdf_ready": pdf.is_available(),
             "all_pages_done": bool(task["pages"]) and all(p["status"] == store.DONE for p in task["pages"]),
         },
     )
@@ -240,6 +342,11 @@ async def api_task(task_id: str):
         "pages": [_page_status_payload(page) for page in task["pages"]],
         "queue": worker.pending,
         "polish": store.get_polish_state(task_id),
+        # True when this task will clean itself as soon as it is read, which the
+        # status page uses to keep polling for the cleanup it has not seen yet.
+        "auto_polish_ready": bool(task.get("auto_polish"))
+        and config.PDF_AUTO_POLISH
+        and config.deepseek_ready(),
     }
 
 
@@ -247,8 +354,6 @@ async def api_task(task_id: str):
 async def api_delete_task(task_id: str):
     _task_or_404(task_id)
     store.delete_task(task_id)
-    import shutil
-
     shutil.rmtree(config.task_dir(task_id), ignore_errors=True)
     return {"deleted": task_id}
 
@@ -331,6 +436,49 @@ async def api_retry_page(task_id: str, page_index: int):
     store.rebuild_task(task_id)
     store.clear_polished_markdown(task_id)
     return {"page_index": page_index, "status": store.QUEUED}
+
+
+# --------------------------------------------------------------------------
+# PDF input
+# --------------------------------------------------------------------------
+
+
+@app.post("/api/tasks/{task_id}/pdf")
+async def api_upload_pdf(task_id: str, file: UploadFile = File(...)):
+    """Render a PDF's pages and queue them, continuing the task's page order.
+
+    One PDF becomes N page images, each read exactly like an uploaded photo. The
+    response reports which pages were queued and which blank ones were skipped.
+    """
+    _task_or_404(task_id)
+    payload = await _ingest_pdf(task_id, file)
+    return JSONResponse(payload, status_code=201)
+
+
+@app.post("/api/convert/pdf")
+async def api_convert_pdf(file: UploadFile = File(...), title: str = Form("")):
+    """Convert a PDF in one call: create the task, render, and start reading.
+
+    Returns ``202`` with a task id as soon as the pages are rendered — OCR runs
+    in the background, so poll ``GET /api/tasks/{id}`` for progress and then
+    ``GET /api/tasks/{id}/markdown`` (or ``?variant=polished``) for the result.
+    """
+    if not pdf.is_available():
+        raise HTTPException(
+            400, "PDF support is not installed — run 'pip install pypdfium2' and restart"
+        )
+
+    name = file.filename or "document.pdf"
+    task_id = store.create_task((title or "").strip() or Path(name).stem or "paper")
+    try:
+        payload = await _ingest_pdf(task_id, file)
+    except Exception:
+        # Do not leave a half-created, pageless task behind on a bad upload.
+        store.delete_task(task_id)
+        shutil.rmtree(config.task_dir(task_id), ignore_errors=True)
+        raise
+
+    return JSONResponse(payload, status_code=202)
 
 
 # --------------------------------------------------------------------------
@@ -587,4 +735,6 @@ async def health():
         "imgbb_configured": bool(config.IMGBB_API_KEY),
         "deepseek_configured": config.deepseek_ready(),
         "deepseek_model": config.DEEPSEEK_MODEL,
+        "pdf_ready": pdf.is_available(),
+        "pdf_dpi": config.PDF_DPI,
     }

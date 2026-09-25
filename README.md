@@ -1,27 +1,31 @@
 # Paper2MD
 
-Photograph the pages of a question paper, upload them, and get back **one
-Markdown file** containing every question — formulas as LaTeX, every figure
-cropped out and placed under the question it belongs to, and the student's
-handwritten answers erased.
+Upload the pages of a question paper — phone photos, **or the PDF itself** — and
+get back **one Markdown file** containing every question: formulas as LaTeX,
+every figure cropped out and placed under the question it belongs to, and the
+student's handwritten answers erased.
 
 Built for maths/physics-style papers where the wording, the formulas *and* the
 diagrams all matter.
 
 ```
-photos of pages
-      │
-      ├─ PP-DocLayoutV3 (local, ~2.5 s) ──▶ pixel-accurate figure boxes ──▶ crop
-      │
-      └─ DeepSeek vision (~30 s) ─────────▶ markdown with LaTeX, handwriting already
-                                            removed, and which question each
-                                            figure belongs to
-                                                     │
-                                    figures cropped locally, matched to questions
-                                                     │
-                                    upload figures ──▶ imgbb.com (public URLs)
-                                                     ▼
-                                            ![Q17 附图](https://…)
+photos of pages ──┐
+                  ├──▶ page images
+a PDF of pages ───┘   (rendered by pypdfium2)
+                            │
+        ┌───────────────────┴───────────────────┐
+        │                                       │
+ PP-DocLayoutV3 (local, ~2.5 s)         DeepSeek vision (~30 s)
+ pixel-accurate figure boxes             markdown with LaTeX, handwriting
+        │                                already removed, and which question
+        │                                each figure belongs to
+        └───────────────────┬───────────────────┘
+                            ▼
+           figures cropped locally, matched to questions
+                            │
+           upload figures ──▶ imgbb.com (public URLs)
+                            ▼
+                    ![Q17 附图](https://…)
 ```
 
 ---
@@ -47,7 +51,8 @@ Either way the installer uses the Tsinghua PyPI mirror by default; override with
 `PIP_INDEX=... ./install.sh`.
 
 To try it immediately there is a ready-made exam page in
-[`samples/exam_page.jpg`](samples/exam_page.jpg).
+[`samples/exam_page.jpg`](samples/exam_page.jpg) — or point the app at any PDF of
+a paper (see [From a PDF](#from-a-pdf)).
 
 ---
 
@@ -101,9 +106,11 @@ If the API is down, or you would rather stay fully offline, set
 
 ## Using it
 
-1. **New task** — give the paper a title, then select every photo at once.
-   *Upload order is page order*: the first file becomes page 1. Drag-and-drop
-   works too.
+1. **New task** — give the paper a title, then select every photo at once — or a
+   PDF. *Upload order is page order*: the first file becomes page 1, and a PDF
+   contributes its pages from wherever it sat in the selection. Drag-and-drop
+   works too. An existing task takes more pages or another PDF at any time
+   (**＋ Add PDF**).
 2. **Wait for reading** — the status page polls itself and shows a progress bar
    (`n / total` pages). ~30 s per page with `auto`, 1–3 minutes with `paddle`.
 3. **Review figures** — each figure gets a card. The engine's detected question
@@ -122,6 +129,49 @@ If the API is down, or you would rather stay fully offline, set
 
 Both long-running steps have a progress bar: page reading, and the cleanup
 (figures uploaded, then cleaned chunk by chunk).
+
+### From a PDF
+
+A PDF is not a second pipeline — it is a second **page source**. On the new-task
+screen, or with **＋ Add PDF** on an existing task, each page is rendered to the
+same JPEG a phone camera would have produced and handed to the normal queue. From
+there figures, the review screen, the cleanup and the download are all unchanged,
+so a PDF and a pile of photos can even be mixed in one task.
+
+* **Rendering** is done by [`pypdfium2`](https://pypi.org/project/pypdfium2/) at
+  `PDF_DPI` (default 200) — a self-contained wheel, no system poppler,
+  Ghostscript or Java. 200 DPI is chosen so small subscripts and decimal points
+  survive, which is exactly what the OCR starts getting wrong at screen
+  resolution.
+* **Blank pages are skipped** (`PDF_SKIP_BLANK`, on by default). Exam PDFs are
+  full of blank backs and separator sheets, and each one would otherwise cost
+  ~30 s of OCR. The test is deliberately conservative — a page is only dropped
+  when it has almost no ink at all — and the response lists exactly which pages
+  were skipped, so nothing disappears silently.
+* **It cleans itself.** A PDF is supposed to come out as a *clean* paper, so as
+  soon as every page has been read successfully the DeepSeek pass starts on its
+  own — no button to press (`PDF_AUTO_POLISH`, on by default; needs a DeepSeek
+  key). A page that failed stops the automatic cleanup rather than cleaning half
+  a paper, and a cleanup interrupted by a restart is picked up again on the next
+  start. Set `PDF_AUTO_POLISH=0` to go back to the manual ✨ Clean up button.
+* **Provenance is kept.** A page's stored name is `paper.pdf · p3`, so any page
+  in the review screen can be traced back to the PDF page it came from. Skipped
+  blanks do not consume a page index, so the number stays truthful.
+* **The text layer is not used.** The PDF is treated as a stack of page images,
+  not parsed for text. That is deliberate: it is the vision pass that produces
+  clean LaTeX, removes the handwriting and places the figures, and a PDF text
+  layer gives none of those.
+
+For a single programmatic call, `POST /api/convert/pdf` creates the task and
+ingests the PDF in one request:
+
+```bash
+curl -F file=@paper.pdf -F title="Midterm 2024" \
+     http://localhost:8000/api/convert/pdf
+# 202 {"task_id": "t-…", "pdf_pages": 12, "queued_pages": 11, "blank_pages": [7], …}
+curl "http://localhost:8000/api/tasks/t-…/markdown"                     # raw
+curl "http://localhost:8000/api/tasks/t-…/markdown?variant=polished"    # once auto-clean finishes
+```
 
 ### Figure format
 
@@ -228,6 +278,20 @@ Copy `.env.example` to `.env` (the installer does this).
 | `DEEPSEEK_MAX_CHARS` | `24000` | Longer papers are cleaned chunk by chunk. |
 | `DEEPSEEK_TIMEOUT` | `600` | Seconds per API call. |
 
+### PDF input
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `PDF_DPI` | `200` | Render resolution. `150` is faster and softer, `300` helps faint scans. |
+| `PDF_JPEG_QUALITY` | `92` | JPEG quality of each rendered page. |
+| `PDF_MAX_PAGES` | `200` | Pages read from one PDF; the rest are reported as skipped. `0` = no cap. |
+| `MAX_PDF_MB` | `100` | Reject PDFs larger than this (they are bigger than photos). |
+| `PDF_FIRST_PAGE` / `PDF_LAST_PAGE` | `1` / `0` | 1-based page range; `0` means "through the last page". |
+| `PDF_SKIP_BLANK` | `1` | Skip essentially-white pages instead of spending OCR time on them. |
+| `PDF_BLANK_RATIO` | `0.0001` | Ink fraction below which a page counts as blank. |
+| `PDF_MAX_PIXELS` | `24000000` | Clamp poster-sized pages so a high `PDF_DPI` cannot exhaust memory. |
+| `PDF_AUTO_POLISH` | `1` | Start the DeepSeek cleanup automatically once a PDF is fully read. `0` = button only. |
+
 ### Where figures are hosted
 
 | `IMAGE_HOST` | What it does | Trade-off |
@@ -261,6 +325,7 @@ app/
   main.py            FastAPI routes + Jinja templates
   worker.py          OCR queue, worker threads, and the cleanup runner
   ocr.py             engine dispatch: PaddleOCR-VL, or the hybrid
+  pdf.py             PDF → page images (pypdfium2), blank skipping, provenance
   layout.py          PP-DocLayoutV3 wrapper — the figure boxes, ~2.5 s locally
   deepseek.py        page reading, cleanup, and figure classification
   markdown_utils.py  normalisation, figure refs, question labelling, merging
@@ -269,7 +334,7 @@ app/
 templates/           index (upload), task (progress), edit (figure → question)
 static/              app.css, app.js, vendored marked + KaTeX (works offline)
 tools/               benchmarks, the DeepSeek probes, comparison helpers
-data/                runtime: paper2md.db, uploads/<task>/{pages,images}
+data/                runtime: paper2md.db, uploads/<task>/{pages,images,pdf}
 ```
 
 **Flow.** Uploading a page writes a JPEG to `data/uploads/<task>/pages/` and
@@ -277,6 +342,11 @@ queues a job. A worker thread resizes the photo (honouring EXIF rotation), runs
 the configured engine, copies cropped figures into `images/`, and stores the
 page's markdown. Task status is derived from its pages, so an interrupted run
 resumes: pages left mid-flight are re-queued on the next start.
+
+**A PDF takes one short detour first.** `pdf.py` renders each page to that same
+JPEG with pypdfium2 and then hands it to the same queue — the original PDF is
+kept under `pdf/` for provenance. Nothing downstream knows the page ever was a
+PDF, which is why figures, review, cleanup and download needed no changes.
 
 **Question numbers are data, not text.** They live in a per-page mapping
 (`{filename: "13"}`) and are applied when markdown is *rendered*, never written
@@ -307,6 +377,8 @@ against the correct reading, +0.04 against the swapped one).
 | `GET` | `/api/tasks` | List tasks |
 | `DELETE` | `/api/tasks/{id}` | Delete a task and its files |
 | `POST` | `/api/tasks/{id}/pages` | Upload page photos (order = page order) |
+| `POST` | `/api/tasks/{id}/pdf` | Render a PDF's pages and queue them (continues page order) |
+| `POST` | `/api/convert/pdf` | Create a task and ingest a PDF in one call — `202`, then poll |
 | `POST` | `/api/tasks/{id}/pages/{n}/retry` | Re-run a failed page |
 | `GET` | `/api/tasks/{id}` | Status, per-page state, cleanup progress |
 | `GET` | `/api/tasks/{id}/pages/{n}` | Page markdown, mapping, figures, questions |
@@ -317,9 +389,9 @@ against the correct reading, +0.04 against the swapped one).
 | `GET` | `/api/tasks/{id}/polish` | Cleanup progress and result |
 | `GET` | `/api/tasks/{id}/markdown` | Merged markdown (`?variant=polished`) |
 | `GET` | `/tasks/{id}/download` | Final `.md` (`?variant=polished`) |
-| `GET` | `/tasks/{id}/pages/{n}/raw` | The original page photo |
+| `GET` | `/tasks/{id}/pages/{n}/raw` | The original page photo (or rendered PDF page) |
 | `GET` | `/tasks/{id}/images/{file}` | One figure |
-| `GET` | `/api/health` | Status, engine, configured hosts |
+| `GET` | `/api/health` | Status, engine, configured hosts, PDF support |
 
 ---
 
@@ -410,9 +482,10 @@ uncertain payoff on an integrated GPU.
 .venv/bin/pytest tests -q            # if you have pytest
 ```
 
-78 tests. The OCR engine, the layout model and the DeepSeek API are all stubbed,
+97 tests. The OCR engine, the layout model and the DeepSeek API are all stubbed,
 so the suite runs offline and fast, while the real app, database, worker threads,
-markdown pipeline, cropping and box matching are exercised for real.
+markdown pipeline, cropping, box matching and PDF rendering (a PDF is built on
+the fly and rendered by pypdfium2) are exercised for real.
 
 `tests/_env.py` points every test at a throwaway data directory **before
 `app.config` is imported** — that ordering matters, because config reads its
@@ -432,6 +505,18 @@ Otherwise lower `OCR_MAX_DIM`.
 
 **A figure is missing from the paper** — its file was not on disk. The engine
 logs `referenced figure not found on disk: <name>`; **Retry** the page.
+
+**A PDF is rejected as "not a PDF" or "could not open"** — the file is corrupt,
+or it is password-protected (remove the password first). A PDF whose pages all
+come back blank is refused with the skipped count; set `PDF_SKIP_BLANK=0` to read
+them anyway.
+
+**A PDF upload says PDF support is not installed** — the renderer is missing:
+`.venv/bin/pip install pypdfium2` (it is in `requirements.txt`, so `./install.sh`
+installs it). `GET /api/health` reports `pdf_ready`.
+
+**A PDF page came out too small or too soft to read** — raise `PDF_DPI` (300
+helps faint scans); lower it if you are short on time or disk.
 
 **Cleanup says the model hit its output limit** — lower `DEEPSEEK_MAX_CHARS` so
 the document is split into smaller chunks.

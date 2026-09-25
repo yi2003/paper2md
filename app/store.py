@@ -41,6 +41,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     polish_status     TEXT NOT NULL DEFAULT 'idle',
     polish_progress   TEXT,
     polish_error      TEXT,
+    auto_polish       INTEGER NOT NULL DEFAULT 0,
     created_at        REAL NOT NULL,
     updated_at        REAL NOT NULL
 );
@@ -136,6 +137,10 @@ def _migrate(connection: sqlite3.Connection) -> None:
         ("polish_status", "ALTER TABLE tasks ADD COLUMN polish_status TEXT NOT NULL DEFAULT 'idle'"),
         ("polish_progress", "ALTER TABLE tasks ADD COLUMN polish_progress TEXT"),
         ("polish_error", "ALTER TABLE tasks ADD COLUMN polish_error TEXT"),
+        (
+            "auto_polish",
+            "ALTER TABLE tasks ADD COLUMN auto_polish INTEGER NOT NULL DEFAULT 0",
+        ),
     ):
         if name not in columns:
             connection.execute(ddl)
@@ -442,6 +447,42 @@ def clear_polished_markdown(task_id: str) -> None:
         "updated_at = ? WHERE id = ?",
         (POLISH_IDLE, time.time(), task_id),
     )
+
+
+# --- automatic cleanup for PDF tasks -----------------------------------------
+
+
+def set_auto_polish(task_id: str, enabled: bool = True) -> None:
+    """Record that this task should be cleaned by itself once it is read.
+
+    Set when a PDF is ingested: a PDF is expected to come out as a clean paper
+    without anyone pressing ✨ Clean up.
+    """
+    _execute(
+        "UPDATE tasks SET auto_polish = ?, updated_at = ? WHERE id = ?",
+        (1 if enabled else 0, time.time(), task_id),
+    )
+
+
+def auto_polish_enabled(task_id: str) -> bool:
+    row = _query_one("SELECT auto_polish FROM tasks WHERE id = ?", (task_id,))
+    return bool(row and row["auto_polish"])
+
+
+def tasks_awaiting_auto_polish() -> list[str]:
+    """Ids of fully-read auto-clean tasks that still have no cleaned paper.
+
+    Drives the startup sweep, so a cleanup cut short by a restart is picked up
+    again rather than sitting un-cleaned forever.
+    """
+    rows = _query(
+        "SELECT id FROM tasks WHERE auto_polish = 1 AND status = ? "
+        "AND merged_markdown IS NOT NULL AND merged_markdown != '' "
+        "AND (polished_markdown IS NULL OR polished_markdown = '') "
+        "AND polish_status != ?",
+        (TASK_DONE, POLISH_RUNNING),
+    )
+    return [row["id"] for row in rows]
 
 
 # --- image hosting cache -----------------------------------------------------

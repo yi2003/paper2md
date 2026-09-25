@@ -144,6 +144,42 @@ MAX_PAGES_PER_UPLOAD = _int("MAX_PAGES_PER_UPLOAD", 50)
 JPEG_SUFFIXES = {".jpg", ".jpeg"}
 ALLOWED_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
 
+# --------------------------------------------------------------------------
+# PDF input — a PDF is rendered into page images and read like photos
+# --------------------------------------------------------------------------
+#
+# Exam papers often arrive as a PDF rather than as photos. A PDF is not a second
+# pipeline: each page is rendered to the same JPEG a camera would have produced
+# and then flows through the normal OCR path, so the figures, the review screen
+# and the DeepSeek cleanup all work unchanged.
+
+# Render resolution. 200 DPI keeps small subscripts and decimal points legible
+# without inflating the page past phone-photo size; 150 is a faster, softer
+# option and 300 helps with faint scans.
+PDF_DPI = _int("PDF_DPI", 200)
+PDF_JPEG_QUALITY = _int("PDF_JPEG_QUALITY", 92)
+# Most pages of one PDF to ingest. Extra pages are reported as skipped rather
+# than silently dropped; 0 removes the cap.
+PDF_MAX_PAGES = _int("PDF_MAX_PAGES", 200)
+# A PDF is usually far bigger than a single photo, so it gets its own limit.
+MAX_PDF_MB = _int("MAX_PDF_MB", 100)
+# 1-based page range. PDF_LAST_PAGE=0 means "through the final page".
+PDF_FIRST_PAGE = _int("PDF_FIRST_PAGE", 1)
+PDF_LAST_PAGE = _int("PDF_LAST_PAGE", 0)
+# Skip pages that are essentially pure white (blank backs, separator sheets) so
+# no OCR time is spent on them. Very conservative: only a page with almost no
+# ink qualifies, because wrongly dropping a real page loses content.
+PDF_SKIP_BLANK = _bool("PDF_SKIP_BLANK", True)
+# Ink fraction (pixels darker than 200/255) below which a page counts as blank.
+PDF_BLANK_RATIO = float(_str("PDF_BLANK_RATIO", "0.0001"))
+# Guard against poster-sized pages blowing up memory at high DPI.
+PDF_MAX_PIXELS = _int("PDF_MAX_PIXELS", 24_000_000)
+PDF_SUFFIXES = {".pdf"}
+# Once every page of a PDF has been read, start the DeepSeek cleanup by itself —
+# a PDF task should end as a clean paper without anyone pressing a button. Set
+# to 0 to leave the ✨ Clean up button as the only trigger.
+PDF_AUTO_POLISH = _bool("PDF_AUTO_POLISH", True)
+
 
 def ensure_dirs() -> None:
     """Create the runtime directories."""
@@ -156,8 +192,9 @@ def ensure_dirs() -> None:
 # --------------------------------------------------------------------------
 #
 #   data/uploads/<task_id>/
-#       pages/page_1.jpg     original upload (1-based name, 0-based index)
+#       pages/page_1.jpg     original photo, or page 1 rendered from a PDF
 #       images/p1_xxx.jpg    figures extracted from page 1
+#       pdf/<name>.pdf       the PDF a page came from, kept for provenance
 #       work/page_1/         scratch space, deleted once OCR finishes
 
 
@@ -165,12 +202,26 @@ def task_dir(task_id: str) -> Path:
     return UPLOADS_DIR / task_id
 
 
+def page_image_name(page_index: int) -> str:
+    """Filename for a page image — shared by photo uploads and PDF renders."""
+    return f"page_{page_index + 1}.jpg"
+
+
+def pages_dir(task_id: str) -> Path:
+    return task_dir(task_id) / "pages"
+
+
 def page_image_path(task_id: str, page_index: int) -> Path:
-    return task_dir(task_id) / "pages" / f"page_{page_index + 1}.jpg"
+    return pages_dir(task_id) / page_image_name(page_index)
 
 
 def images_dir(task_id: str) -> Path:
     return task_dir(task_id) / "images"
+
+
+def pdf_dir(task_id: str) -> Path:
+    """Where the original PDFs uploaded to a task are kept."""
+    return task_dir(task_id) / "pdf"
 
 
 def work_dir(task_id: str, page_index: int) -> Path:

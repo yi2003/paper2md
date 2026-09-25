@@ -5,9 +5,11 @@
 <section class="panel">
   <h2>New task</h2>
   <p class="hint">
-    Pick every photo of the same exam paper. The upload order is the page order —
-    the first picture you select becomes page 1.
-    Accepted: JPG, PNG, WebP, BMP, TIFF · up to {{ max_upload_mb }} MB each.
+    Pick every photo of the same exam paper — or drop in a PDF. The upload order
+    is the page order: the first file you select becomes page 1, and a PDF
+    contributes its pages in order from wherever you dropped it.
+    Accepted: JPG, PNG, WebP, BMP, TIFF up to {{ max_upload_mb }} MB each
+    {%- if pdf_ready %} · PDF up to {{ max_pdf_mb }} MB{% endif %}.
   </p>
 
   <div class="row" style="margin-bottom:12px">
@@ -16,10 +18,10 @@
   </div>
 
   <label class="dropzone" id="dropzone" for="fileInput">
-    <strong>Click to choose photos, or drop them here</strong>
+    <strong>Click to choose photos or a PDF, or drop them here</strong>
     You can select many at once · OCR runs {{ ocr_workers }} page at a time
   </label>
-  <input type="file" id="fileInput" accept="image/*" multiple hidden>
+  <input type="file" id="fileInput" accept="image/*,application/pdf,.pdf" multiple hidden>
 
   <div class="thumbs" id="thumbs"></div>
 
@@ -83,15 +85,34 @@ const clearBtn = document.getElementById("clearBtn");
 const selectionInfo = document.getElementById("selectionInfo");
 const titleInput = document.getElementById("title");
 
+/** A PDF is rendered into page images server-side; everything else is a photo. */
+function isPdf(file) {
+  return file.type === "application/pdf" || /\.pdf$/i.test(file.name);
+}
+
+function previewFor(file) {
+  if (isPdf(file)) {
+    const doc = document.createElement("div");
+    doc.className = "doc";
+    const badge = document.createElement("strong");
+    badge.textContent = "PDF";
+    const label = document.createElement("span");
+    label.textContent = file.name;
+    doc.append(badge, label);
+    return doc;
+  }
+  const image = document.createElement("img");
+  image.src = URL.createObjectURL(file);
+  image.onload = () => URL.revokeObjectURL(image.src);
+  image.alt = file.name;
+  return image;
+}
+
 function renderThumbs() {
   thumbs.innerHTML = "";
   selected.forEach((file, index) => {
     const card = document.createElement("div");
     card.className = "thumb";
-    const image = document.createElement("img");
-    image.src = URL.createObjectURL(file);
-    image.onload = () => URL.revokeObjectURL(image.src);
-    image.alt = file.name;
     const number = document.createElement("span");
     number.className = "n";
     number.textContent = String(index + 1);
@@ -104,13 +125,14 @@ function renderThumbs() {
       selected.splice(index, 1);
       renderThumbs();
     };
-    card.append(image, number, remove);
+    card.append(previewFor(file), number, remove);
     thumbs.appendChild(card);
   });
 
   const totalMb = selected.reduce((sum, file) => sum + file.size, 0) / (1024 * 1024);
+  const pdfs = selected.filter(isPdf).length;
   selectionInfo.textContent = selected.length
-    ? `${selected.length} page(s), ${totalMb.toFixed(1)} MB total`
+    ? `${selected.length} item(s)${pdfs ? `, ${pdfs} PDF` : ""}, ${totalMb.toFixed(1)} MB total`
     : "";
   startBtn.disabled = selected.length === 0;
   clearBtn.disabled = selected.length === 0;
@@ -118,7 +140,7 @@ function renderThumbs() {
 
 function addFiles(fileList) {
   for (const file of fileList) {
-    if (file.type.startsWith("image/")) selected.push(file);
+    if (file.type.startsWith("image/") || isPdf(file)) selected.push(file);
   }
   renderThumbs();
 }
@@ -153,24 +175,61 @@ startBtn.addEventListener("click", async () => {
   startBtn.disabled = true;
   clearBtn.disabled = true;
   startBtn.textContent = "Creating task…";
+
+  let taskId = null;
+  let queued = 0;
+  let imageBatch = [];
+
+  const flushImages = async () => {
+    if (!imageBatch.length) return;
+    const batch = imageBatch;
+    imageBatch = [];
+    const form = new FormData();
+    batch.forEach((file) => form.append("files", file, file.name));
+    const result = await api(`/api/tasks/${taskId}/pages`, { method: "POST", body: form });
+    queued += result.accepted.length;
+    if (result.skipped.length) {
+      toast(`${result.skipped.length} file(s) skipped: ${result.skipped[0].reason}`, true);
+    }
+  };
+
   try {
     const created = await api("/api/tasks", jsonRequest("POST", { title: titleInput.value }));
-    const taskId = created.task_id;
+    taskId = created.task_id;
 
-    let uploaded = 0;
-    for (let start = 0; start < selected.length; start += MAX_BATCH) {
-      const batch = selected.slice(start, start + MAX_BATCH);
-      const form = new FormData();
-      batch.forEach((file) => form.append("files", file, file.name));
-      startBtn.textContent = `Uploading ${uploaded + batch.length} / ${selected.length}…`;
-      const result = await api(`/api/tasks/${taskId}/pages`, { method: "POST", body: form });
-      uploaded += result.accepted.length;
-      if (result.skipped.length) {
-        toast(`${result.skipped.length} file(s) skipped: ${result.skipped[0].reason}`, true);
+    for (const file of selected) {
+      if (isPdf(file)) {
+        // Render the PDF where it sits in the selection, so page order holds.
+        await flushImages();
+        startBtn.textContent = `Rendering ${file.name}…`;
+        const form = new FormData();
+        form.append("file", file, file.name);
+        const result = await api(`/api/tasks/${taskId}/pdf`, { method: "POST", body: form });
+        queued += result.queued_pages;
+        if (result.blank_pages.length) {
+          toast(`${result.blank_pages.length} blank page(s) skipped in ${file.name}`);
+        }
+      } else {
+        imageBatch.push(file);
+        if (imageBatch.length >= MAX_BATCH) await flushImages();
       }
+    }
+    await flushImages();
+
+    if (!queued) {
+      toast("Nothing was queued — check the file types", true);
+      startBtn.disabled = false;
+      clearBtn.disabled = false;
+      startBtn.textContent = "Upload & start OCR";
+      return;
     }
     window.location.href = `/tasks/${taskId}`;
   } catch (error) {
+    if (taskId && queued > 0) {
+      toast(`${error.message} — opening the task with the pages that did upload`, true);
+      window.location.href = `/tasks/${taskId}`;
+      return;
+    }
     toast(error.message, true);
     startBtn.disabled = false;
     clearBtn.disabled = false;

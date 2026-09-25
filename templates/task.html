@@ -31,6 +31,9 @@
     Task <span class="mono">{{ task.id }}</span> ·
     <span id="progressText">{{ task.pages | selectattr('status', 'equalto', 'done') | list | length }} / {{ task.pages | length }} pages finished</span>
     · <span id="queueText"></span>
+    {% if task.auto_polish and deepseek_ready and not polish_info %}
+    · <span class="muted" title="This task came from a PDF, so DeepSeek cleans it automatically once every page has been read">auto-clean on</span>
+    {% endif %}
     {% if polish_info %}
     · <span style="color:var(--ok)">cleaned with {{ polish_info.model }}
       · {{ polish_info.chunks }} chunk(s) · {{ polish_info.figures_total }} figure(s)
@@ -41,6 +44,10 @@
   <div class="row" style="margin-top:6px">
     <label class="btn" for="addPages">＋ Add more pages</label>
     <input type="file" id="addPages" accept="image/*" multiple hidden>
+    {% if pdf_ready %}
+    <label class="btn" for="addPdf">＋ Add PDF</label>
+    <input type="file" id="addPdf" accept="application/pdf,.pdf" hidden>
+    {% endif %}
     <span class="muted" id="addInfo"></span>
   </div>
 
@@ -50,7 +57,7 @@
 
 <section class="panel">
   <h2>Pages</h2>
-  <p class="hint">Each photo is processed in upload order. Figures found on a page appear in the review screen.</p>
+  <p class="hint">Each photo — or rendered PDF page — is processed in upload order. Figures found on a page appear in the review screen.</p>
   <div class="cards" id="cards">
     {% for page in task.pages %}
     <div class="card" data-page="{{ page.page_index }}">
@@ -65,6 +72,7 @@
         <div class="meta" data-role="meta">
           {% if page.status == 'done' %}{{ page.image_count }} figure(s){% else %}waiting{% endif %}
         </div>
+        {% if page.filename %}<div class="mono muted file" title="{{ page.filename }}">{{ page.filename }}</div>{% endif %}
         <div class="err" data-role="error">{{ page.error or "" }}</div>
         <div class="row" data-role="actions"></div>
       </div>
@@ -83,6 +91,7 @@ const TASK_ID = {{ task.id | tojson }};
 const TERMINAL = ["done", "partial", "failed"];
 let pollTimer = null;
 let previousPolishStatus = null;
+let autoWait = 0;
 
 function renderActions(card, page) {
   const actions = card.querySelector('[data-role="actions"]');
@@ -202,7 +211,16 @@ async function refresh() {
   }
 
   // Keep polling while either job is live; stop once everything has settled.
-  const keepPolling = pagesActive || polishing;
+  // An auto-clean task gets a short grace window: the cleanup starts in the
+  // worker thread an instant after the last page settles, so a poll can land
+  // just before its "running" state exists. Keep looking for a few ticks
+  // instead of stopping on "idle" and never showing the result.
+  const awaitingAuto = !pagesActive && !failed && polishStatus === "idle"
+    && data.auto_polish_ready;
+  if (awaitingAuto) autoWait += 1;
+  else autoWait = 0;
+
+  const keepPolling = pagesActive || polishing || (awaitingAuto && autoWait <= 6);
   if (keepPolling && !pollTimer) {
     pollTimer = setInterval(refresh, 1500);
   } else if (!keepPolling && pollTimer) {
@@ -227,6 +245,29 @@ document.getElementById("addPages").addEventListener("change", async (event) => 
     toast(error.message, true);
   }
 });
+
+const addPdfInput = document.getElementById("addPdf");
+if (addPdfInput) {
+  addPdfInput.addEventListener("change", async (event) => {
+    const file = (event.target.files || [])[0];
+    if (!file) return;
+    const info = document.getElementById("addInfo");
+    info.textContent = `Rendering ${file.name}…`;
+    try {
+      const form = new FormData();
+      form.append("file", file, file.name);
+      const result = await api(`/api/tasks/${TASK_ID}/pdf`, { method: "POST", body: form });
+      info.textContent = `${result.queued_pages} page(s) queued`;
+      if (result.blank_pages.length) {
+        toast(`${result.blank_pages.length} blank page(s) skipped`);
+      }
+      window.location.reload();
+    } catch (error) {
+      info.textContent = "";
+      toast(error.message, true);
+    }
+  });
+}
 
 document.getElementById("deleteTask").addEventListener("click", async () => {
   if (!confirm("Delete this task and all its uploaded pages?")) return;
