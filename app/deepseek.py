@@ -11,6 +11,10 @@ or a long ImgBB URL may quietly corrupt it. So every figure is swapped for an
 opaque marker (``[[FIG3-Q13]]`` — "figure 3 belongs to question 13") before the
 call, and swapped back afterwards. Missing markers are re-attached rather than
 lost.
+
+A row of side-by-side figures — a flexbox div the user built by hand — is
+protected the same way, but as one whole block (``[[ROW1]]``), so the cleanup
+leaves that layout exactly as it was written instead of flattening it.
 """
 
 from __future__ import annotations
@@ -26,7 +30,12 @@ from typing import Any, Callable
 import requests
 
 from . import config
-from .markdown_utils import ALT_QUESTION_RE, normalize_question
+from .markdown_utils import (
+    ALT_QUESTION_RE,
+    is_figure_row,
+    iter_div_blocks,
+    normalize_question,
+)
 
 # Any figure reference, HTML or markdown, local path or remote URL.
 _ANY_IMG_RE = re.compile(r"<img\s[^>]*?>|!\[[^\]]*\]\([^)]*\)", re.IGNORECASE)
@@ -34,6 +43,8 @@ _ANY_IMG_RE = re.compile(r"<img\s[^>]*?>|!\[[^\]]*\]\([^)]*\)", re.IGNORECASE)
 _LABEL_BEFORE_RE = re.compile(r"\*\[Q(\d+)\s*附图\]\*\s*\Z")
 # Our marker, matched leniently in case the model adds whitespace.
 _TOKEN_RE = re.compile(r"\[\[\s*FIG\s*(\d+)\s*(?:-\s*Q\s*(\d+)\s*)?\]\]", re.IGNORECASE)
+# The marker standing in for a hand-built row of side-by-side figures.
+_ROW_TOKEN_RE = re.compile(r"\[\[\s*ROW\s*(\d+)\s*\]\]", re.IGNORECASE)
 _PAGE_MARKER_RE = re.compile(r"<!--\s*/?page\s*\d+\s*-->\s*", re.IGNORECASE)
 _EMPTY_DIV_RE = re.compile(r"<div[^>]*?>\s*</div>", re.IGNORECASE)
 
@@ -55,21 +66,29 @@ KEEP (this is printed):
 
 Where an answer was written in, restore an empty blank: \\underline{\\hspace{2em}}
   e.g.  "则 $x+y=\\underline{5}$"      ->  "则 $x+y=\\underline{\\hspace{2em}}$"
-  e.g.  "圆心角是 120 度"                ->  "圆心角是 \\underline{\\hspace{2em}} 度"
+  e.g.  "圆心角是 120 度"                ->  "圆心角是 $\\underline{\\hspace{2em}}$ 度"
 
 RULES
 1. Copy printed text EXACTLY. Never rephrase, translate, summarise, reorder or
    renumber the questions.
 2. Reproduce all LaTeX unchanged: $...$, \\(...\\), \\[...\\], \\begin{...}...\\end{...}.
+   EVERY LaTeX fragment must sit inside a delimiter — including a blank that
+   stands alone between two words of prose. Bare \\underline{\\hspace{2em}} in the
+   middle of a sentence is the one mistake that ruins a line: the reader sees
+   the backslashes instead of a ruled space.
 3. Figures appear as markers such as [[FIG3-Q13]], meaning figure 3 belongs to
    question 13. Move each marker onto its own line immediately after the
    question it names. Copy the marker text character-for-character.
    Every marker you are given must appear exactly once: never invent, delete,
    duplicate, reorder or renumber one.
-4. Drop OCR noise: stray single characters, orphaned punctuation, fragments like
+4. A marker such as [[ROW1]] is a row of figures laid out side by side, kept
+   by the user on purpose. Leave it on one line, where it appeared, and copy it
+   character-for-character. Never move a figure out of a row, and never split a
+   row across lines. Every row marker must appear exactly once.
+5. Drop OCR noise: stray single characters, orphaned punctuation, fragments like
    "n", "~", "nm", and empty <div> wrappers.
-5. Remove page markers such as <!-- page 2 -->.
-6. Output GitHub-flavoured Markdown only. No preamble, no commentary, no code
+6. Remove page markers such as <!-- page 2 -->.
+7. Output GitHub-flavoured Markdown only. No preamble, no commentary, no code
    fences, no answers, no explanations.
 """
 
@@ -167,6 +186,81 @@ def _by_figure_id(mapping: dict[str, dict[str, str]], figure_id: str) -> str | N
         if marker.startswith(f"[[FIG{figure_id}-") or marker == f"[[FIG{figure_id}]]":
             return marker
     return None
+
+
+# --------------------------------------------------------------------------
+# Layout rows
+# --------------------------------------------------------------------------
+#
+# A row is a div the user built to put figures side by side. The cleanup prompt
+# tells the model to drop wrapper divs, so an unprotected row would be flattened
+# without anyone noticing. Protecting the whole block — rather than the figures
+# inside it — hands the model one token it must copy verbatim, and the layout
+# comes back exactly as it was written.
+
+
+def _row_blocks(markdown: str) -> list[tuple[int, int]]:
+    """Spans of the outermost figure rows, in document order."""
+    blocks = [
+        (start, end, open_tag, inner)
+        for start, end, open_tag, inner in iter_div_blocks(markdown)
+        if is_figure_row(open_tag, inner)
+    ]
+    spans: list[tuple[int, int]] = []
+    for start, end, _open_tag, _inner in sorted(blocks, key=lambda item: item[0]):
+        # A row wrapped in another row is one row; take the outer span only.
+        if any(start >= outer_start and end <= outer_end for outer_start, outer_end in spans):
+            continue
+        spans.append((start, end))
+    return spans
+
+
+def protect_rows(markdown: str) -> tuple[str, dict[str, str]]:
+    """Swap every figure row for an opaque ``[[ROW1]]`` marker.
+
+    Returns the rewritten markdown and ``{marker: row_html}``.
+    """
+    spans = _row_blocks(markdown)
+    if not spans:
+        return markdown, {}
+
+    out = markdown
+    mapping: dict[str, str] = {}
+    # Numbered in document order, but rewritten from the end: replacing an
+    # earlier block would otherwise shift the offsets of the later ones.
+    for index in range(len(spans) - 1, -1, -1):
+        start, end = spans[index]
+        marker = f"[[ROW{index + 1}]]"
+        out = out[:start] + marker + out[end:]
+        mapping[marker] = markdown[start:end]
+    return out, mapping
+
+
+def restore_rows(markdown: str, mapping: dict[str, str]) -> tuple[str, list[str]]:
+    """Put the rows back. Returns the markdown and any markers the model dropped."""
+    if not mapping:
+        return markdown, []
+
+    seen: set[str] = set()
+
+    def replace(match: re.Match[str]) -> str:
+        marker = f"[[ROW{match.group(1)}]]"
+        resolved = marker if marker in mapping else next(
+            (key for key in mapping if key.startswith(f"[[ROW{match.group(1)}")),
+            None,
+        )
+        if resolved is None:
+            return ""
+        seen.add(resolved)
+        return mapping[resolved]
+
+    out = _ROW_TOKEN_RE.sub(replace, markdown)
+
+    missing = [marker for marker in mapping if marker not in seen]
+    if missing:
+        # Never lose a layout the user made by hand: append what was dropped.
+        out = out.rstrip() + "\n\n" + "\n\n".join(mapping[marker] for marker in missing) + "\n"
+    return out, missing
 
 
 # --------------------------------------------------------------------------
@@ -438,7 +532,8 @@ Transcribe the PRINTED text into GitHub-flavoured Markdown, mathematics as
 LaTeX ($...$ or $$...$$). Keep the question numbers exactly as printed.
 REMOVE anything handwritten by the student: answers written into blanks, working,
 notes, ticks, crosses, underlines, circled option letters. Where an answer was
-written in, leave an empty blank: \\underline{\\hspace{2em}}.
+written in, leave an empty blank: \\underline{\\hspace{2em}} — always inside $...$,
+even when it stands alone between two words.
 
 PART 2 - FIGURES
 List every FIGURE on the page: a diagram, chart, graph, geometric drawing, or
@@ -454,12 +549,45 @@ Reply with JSON only, no code fences:
 {"markdown": "...", "figures": [{"x1": 0, "y1": 0, "x2": 0, "y2": 0, "question": "13"}]}
 """
 
+# The same page read without being asked about figures. Used when OCR is not
+# allowed to find them: the figures are cut out by hand afterwards, so asking
+# for boxes would be work the answer is thrown away on. It also drops the JSON
+# wrapper, which is pure overhead when there is no second field to carry.
+TEXT_PAGE_PROMPT = """\
+This is a photographed exam paper page. Read it.
 
-def read_page(image_path: Path, model: str | None = None) -> tuple[str, list[dict[str, Any]]]:
+Transcribe the PRINTED text into GitHub-flavoured Markdown, mathematics as
+LaTeX ($...$ or $$...$$). Keep the question numbers exactly as printed.
+REMOVE anything handwritten by the student: answers written into blanks, working,
+notes, ticks, crosses, underlines, circled option letters. Where an answer was
+written in, leave an empty blank: \\underline{\\hspace{2em}} — always inside $...$,
+even when it stands alone between two words.
+
+Diagrams and other figures are added separately, by hand. Do not transcribe
+anything inside one, do not describe it, and do not write an <img> tag, an image
+or any placeholder for it — nothing but the printed text and the LaTeX.
+
+Output GitHub-flavoured Markdown only: no preamble, no commentary, no code
+fences.
+"""
+
+
+def read_page(
+    image_path: Path, model: str | None = None, figures: bool = True
+) -> tuple[str, list[dict[str, Any]]]:
     """Read a whole page with DeepSeek.
 
-    Returns ``(markdown, figures)`` where each figure is
-    ``{"x1","y1","x2","y2", "question"}`` in normalised 0-1000 coordinates.
+    Args:
+        image_path: the page photo.
+        model: override the resolved model id.
+        figures: whether to ask the model where the figures are. Pass ``False``
+            when they are cut out by hand: the question is then not asked at
+            all, and the reply is plain markdown rather than JSON.
+
+    Returns:
+        ``(markdown, figures)`` where each figure is
+        ``{"x1","y1","x2","y2", "question"}`` in normalised 0-1000 coordinates.
+        Always empty when ``figures`` is False.
     """
     if not config.DEEPSEEK_API_KEY:
         raise DeepSeekError("DEEPSEEK_API_KEY is not set")
@@ -473,7 +601,7 @@ def read_page(image_path: Path, model: str | None = None) -> tuple[str, list[dic
             {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": PAGE_PROMPT},
+                    {"type": "text", "text": PAGE_PROMPT if figures else TEXT_PAGE_PROMPT},
                     {
                         "type": "image_url",
                         "image_url": {"url": f"data:image/jpeg;base64,{encoded}"},
@@ -514,6 +642,13 @@ def read_page(image_path: Path, model: str | None = None) -> tuple[str, list[dic
     if not text.strip():
         raise DeepSeekError("DeepSeek returned an empty page")
 
+    if not figures:
+        # Plain markdown was asked for, so there is nothing to unwrap — but a
+        # fenced reply still has to be cleaned up before it is stored.
+        markdown = _unfence(text)
+        log(f"page reply: {len(markdown):,} chars, figures not requested")
+        return markdown, []
+
     parsed = _extract_json(text)
     if parsed is None:
         # No JSON: still usable if it wrote markdown, just without figure links.
@@ -538,6 +673,13 @@ def read_page(image_path: Path, model: str | None = None) -> tuple[str, list[dic
 
     log(f"page reply: {len(markdown):,} chars, {len(figures)} figure hint(s)")
     return markdown, figures
+
+
+def _unfence(text: str) -> str:
+    """The body of a reply the model wrapped in a code fence anyway."""
+    fenced = re.fullmatch(r"\s*```(?:markdown|md)?\s*\n?(.*?)\n?\s*```\s*", text, re.S)
+    body = fenced.group(1) if fenced else text
+    return _PAGE_MARKER_RE.sub("", body).strip()
 
 
 def _extract_json(text: str) -> dict[str, Any] | None:
@@ -687,7 +829,7 @@ def polish_markdown(
 
     Returns:
         ``(cleaned_markdown, info)`` where info carries the model used, token
-        usage and any figures the model dropped.
+        usage, and any figures or layout rows the model dropped.
     """
     if not config.DEEPSEEK_API_KEY:
         raise DeepSeekError(
@@ -697,7 +839,11 @@ def polish_markdown(
         raise DeepSeekError("there is nothing to clean up yet")
 
     model = resolve_model()
-    chunks = split_into_chunks(markdown)
+    # Rows first, and before chunking: a protected row is one short token, so it
+    # cannot be split across chunks, and the figures inside it are restored with
+    # the row rather than on their own.
+    protected_doc, rows = protect_rows(markdown)
+    chunks = split_into_chunks(protected_doc)
     log(f"cleaning {len(markdown):,} chars in {len(chunks)} chunk(s) with {model}")
 
     def report(stage: str, done: int, total: int) -> None:
@@ -740,11 +886,18 @@ def polish_markdown(
         )
         report("cleaning", number, chunk_count)
 
+    cleaned = "\n\n".join(part for part in cleaned_parts if part).strip() + "\n"
+    cleaned, rows_missing = restore_rows(cleaned, rows)
+    if rows:
+        log(f"{len(rows)} layout row(s) preserved, {len(rows_missing)} recovered")
+
     info: dict[str, Any] = {
         "model": model,
         "chunks": len(chunks),
         "usage": usage,
         "figures_total": figures_total,
         "figures_recovered": len(dropped),
+        "rows_total": len(rows),
+        "rows_recovered": len(rows_missing),
     }
-    return "\n\n".join(part for part in cleaned_parts if part).strip() + "\n", info
+    return cleaned, info

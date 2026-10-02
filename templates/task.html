@@ -88,6 +88,8 @@
 {% block scripts %}
 <script>
 const TASK_ID = {{ task.id | tojson }};
+const ENGINES = {{ ocr_engines | tojson }};
+const DEFAULT_ENGINE = {{ ocr_engine | tojson }};
 const TERMINAL = ["done", "partial", "failed"];
 let pollTimer = null;
 let previousPolishStatus = null;
@@ -102,6 +104,9 @@ function renderActions(card, page) {
     link.href = `/tasks/${TASK_ID}/edit?page=${page.page_index}`;
     link.textContent = "Review figures";
     actions.appendChild(link);
+  }
+  if (page.status === "done" || page.status === "failed") {
+    actions.appendChild(rereadControls(page));
   }
   if (page.status === "failed") {
     const retry = document.createElement("button");
@@ -121,6 +126,66 @@ function renderActions(card, page) {
     };
     actions.appendChild(retry);
   }
+}
+
+// Read this page again. The engine picker matters: DeepSeek reads at
+// temperature 0, so asking it twice gives the same answer — the second opinion
+// has to come from the other engine.
+function rereadControls(page) {
+  const wrap = document.createElement("span");
+  wrap.className = "reread";
+
+  const engine = document.createElement("select");
+  engine.title = "Which engine reads this page";
+  const current = page.engine || DEFAULT_ENGINE;
+  for (const name of ENGINES) {
+    const option = document.createElement("option");
+    option.value = name;
+    option.textContent = name;
+    if (name === current) option.selected = true;
+    engine.appendChild(option);
+  }
+  if (current && !ENGINES.includes(current)) {
+    const option = document.createElement("option");
+    option.value = current;
+    option.textContent = current;
+    option.selected = true;
+    engine.appendChild(option);
+  }
+
+  const button = document.createElement("button");
+  button.textContent = "↻ Re-read";
+  button.title =
+    `Read page ${page.page_index + 1} again from its original photo. ` +
+    "The text is replaced; your figure numbers are kept. " +
+    (page.status === "failed" ? "" : "Any hand-edited markdown for this page is lost.");
+  button.onclick = async () => {
+    const which = engine.value;
+    const extra =
+      page.status === "failed" ? "" :
+      `\n\nThe text of this page is replaced, and any hand-edited markdown for it is lost.`;
+    if (!confirm(`Read page ${page.page_index + 1} again with "${which}"?${extra}`)) return;
+    button.disabled = true;
+    engine.disabled = true;
+    button.textContent = "Queueing…";
+    try {
+      await api(`/api/tasks/${TASK_ID}/pages/${page.page_index}/reread`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ engine: which }),
+      });
+      toast(`Page ${page.page_index + 1} queued for another read`);
+      refresh();
+    } catch (error) {
+      toast(error.message, true);
+      button.disabled = false;
+      engine.disabled = false;
+      button.textContent = "↻ Re-read";
+    }
+  };
+
+  wrap.append(engine, button);
+  return wrap;
 }
 
 function applyPage(card, page) {

@@ -2,8 +2,8 @@
 
 Upload the pages of a question paper — phone photos, **or the PDF itself** — and
 get back **one Markdown file** containing every question: formulas as LaTeX,
-every figure cropped out and placed under the question it belongs to, and the
-student's handwritten answers erased.
+every figure placed under the question it belongs to, and the student's
+handwritten answers erased.
 
 Built for maths/physics-style papers where the wording, the formulas *and* the
 diagrams all matter.
@@ -13,17 +13,16 @@ photos of pages ──┐
                   ├──▶ page images
 a PDF of pages ───┘   (rendered by pypdfium2)
                             │
-        ┌───────────────────┴───────────────────┐
-        │                                       │
- PP-DocLayoutV3 (local, ~2.5 s)         DeepSeek vision (~30 s)
- pixel-accurate figure boxes             markdown with LaTeX, handwriting
-        │                                already removed, and which question
-        │                                each figure belongs to
-        └───────────────────┬───────────────────┘
                             ▼
-           figures cropped locally, matched to questions
+                 DeepSeek vision (~30 s a page)
+                 markdown with LaTeX, handwriting
+                 already removed. No figures: you
+                 draw those yourself.
                             │
-           upload figures ──▶ imgbb.com (public URLs)
+                            ▼
+      ▭ Outline a figure ──▶ you drag a rectangle on the page photo
+                            │
+             upload figures ─┴─▶ imgbb.com (public URLs)
                             ▼
                     ![Q17 附图](https://…)
 ```
@@ -67,25 +66,26 @@ OCR_ENGINE=auto      # auto | paddle | deepseek
 | engine | how it works | time/page | memory | needs |
 |---|---|---|---|---|
 | `paddle` | PaddleOCR-VL end to end, all local | ~90–130 s | ~9 GB | nothing (offline) |
-| `deepseek` | local layout boxes + DeepSeek reads the text | **~30 s** | ~300 MB | DeepSeek API key |
-| `auto` *(default)* | `deepseek`, falling back to `paddle` if the API or layout model fails | — | — | key, but degrades safely |
+| `deepseek` | DeepSeek vision reads the whole page | **~30 s** | ~300 MB | DeepSeek API key |
+| `auto` *(default)* | `deepseek`, falling back to `paddle` if the API fails | — | — | key, but degrades safely |
 
-**Why the hybrid, rather than letting DeepSeek do everything?** Because its
-bounding boxes are only approximate. Measured against PaddleOCR-VL's on a real
-page, its boxes disagreed on granularity — it split regions Paddle merged, and
-flagged a tax table as a figure. Cropping from an approximate box either clips
-the diagram or keeps the very handwriting you are trying to remove.
+A PDF is rendered to page images and read exactly like a photo, so **DeepSeek
+reads images and PDFs the same way** — one vision call per page, with the
+handwriting removed in the same pass. That is why the separate cleanup step is
+not needed on this path.
 
-`PP-DocLayoutV3` — the *detection* half of PaddleOCR-VL, without the 0.9B
-recognition model — gives pixel-accurate boxes in **~2.5 s, locally and free**.
-So the pixels come from there and DeepSeek is asked only what it is good at:
-reading the page, and saying which question each figure belongs to.
+PaddleOCR-VL is kept for one job: if the API is down, `auto` still reads the
+paper, locally and offline. DeepSeek reads the text; the figure *boxes* come from
+a layout model (`PP-DocLayoutV3`, ~2.5 s, local and free) because DeepSeek is
+worse at them — its boxes disagreed with PaddleOCR-VL's on granularity, splitting
+regions Paddle merged and flagging a tax table as a figure. DeepSeek does name
+the question each figure belongs to.
 
-DeepSeek reads better than PaddleOCR-VL (cleaner LaTeX) **and removes the
-handwriting in the same pass**, so the separate cleanup step is not needed. It
-also has a useful side effect: layout detection separates figures Paddle merges
-— a 480×173 region covering both a cylinder diagram and a bar chart came back as
-two figures, correctly placed under different questions.
+**Figures are found first and fixed by hand after.** Detection gets the easy
+ones, and the review screen is where the rest get sorted out: a rectangle you
+drag on the page photo becomes a figure like any other, cut from the original
+photo rather than the downscaled copy the model saw. See
+[Fixing a figure the OCR got wrong](#fixing-a-figure-the-ocr-got-wrong).
 
 **Timing is dominated by reasoning, not by the image.** It varies a lot per page:
 
@@ -113,18 +113,23 @@ If the API is down, or you would rather stay fully offline, set
    (**＋ Add PDF**).
 2. **Wait for reading** — the status page polls itself and shows a progress bar
    (`n / total` pages). ~30 s per page with `auto`, 1–3 minutes with `paddle`.
-3. **Review figures** — each figure gets a card. The engine's detected question
-   numbers arrive **pre-filled**, so you are correcting rather than typing.
+3. **Draw the figures** — OCR does not look for them. Open **▭ Outline a figure**,
+   drag a rectangle over the page photo, and the region becomes a figure; see
+   [Fixing a figure the OCR got wrong](#fixing-a-figure-the-ocr-got-wrong).
+4. **Number them** — each figure gets a card. Type the question it belongs to,
+   or let the page do it:
    * **Auto-fill: next questions** — numbers figures top-to-bottom from a
      question you pick (uses the recorded coordinates, so "top to bottom" is the
      real reading order).
    * **Auto-fill: match detected** — matches figures to the question numbers
      found on the page.
    * Or just type. Changes save automatically and the preview re-renders.
-4. **Upload figures** — sends them to the image host and shows the exact final
+5. **Lay the figures out** *(optional)* — put two of them on one line, see
+   [Figures on one line](#figures-on-one-line).
+6. **Upload figures** — sends them to the image host and shows the exact final
    markdown, so links can be checked before downloading.
-5. **Clean up** *(optional with `auto`)* — see [Cleanup](#cleanup).
-6. **Download** — the whole paper as `.md`, or a single page. Once cleaned, a
+7. **Clean up** *(optional with `auto`)* — see [Cleanup](#cleanup).
+8. **Download** — the whole paper as `.md`, or a single page. Once cleaned, a
    **Cleaned .md** button appears alongside; the original is always kept.
 
 Both long-running steps have a progress bar: page reading, and the cleanup
@@ -186,6 +191,135 @@ and its question stay together in any renderer:
 A question with one figure gets `附图`; a question with several gets `附图1`,
 `附图2`, so two diagrams under one question stay distinguishable.
 
+### Editing the markdown
+
+The page preview is the page, not a picture of it: **✎ Markdown** opens the
+exact text that goes into the `.md`, and what you save there is what every
+download and every cleanup uses. Nothing is hidden behind the UI — reorder
+questions, retype a stem, drop a paragraph, move a figure.
+
+* **Save** stores the page as you typed it. **Revert to generated** throws it
+  away and goes back to the OCR text plus the figure numbers, which are kept
+  meanwhile — so you can try a layout, dislike it, and get your numbers back.
+* The preview re-renders as you type; `Ctrl`/`Cmd`+`S` saves.
+* Text is normalised on the way in, the same way OCR output is: `<img/>` becomes
+  `<img>`, `imgs/x.jpg` becomes `images/x.jpg`.
+* While a page is hand-edited, the figure cards say so. Question numbers and
+  **✕** are then *not* applied to that page — they are what **Revert to
+  generated** will use.
+* Re-reading a page (a retry) drops its edited text: it was written against
+  output that no longer exists.
+
+### Figures on one line
+
+Two small figures of one question read much better side by side than stacked
+with a paragraph between them. Markdown has no way to say "same line", so a row
+is an ordinary flexbox `div`:
+
+```html
+<div class="p2md-row" style="display:flex; flex-wrap:wrap; align-items:flex-end; justify-content:center; gap:12px; margin:0.6em 0;">
+<img src="https://i.ibb.co/93sZK3jf/a6283adda502.jpg" alt="Q16 附图" style="max-height:200px">
+<img src="https://i.ibb.co/WqKW04v/d5ff1fbf1ec7.jpg" alt="Q16 附图2" style="max-height:200px">
+</div>
+```
+
+You do not have to write that. Mark two or more figure cards with **⇄**, press
+**⤢ One line**, and the row is built for you: the figures are moved out of their
+OCR wrappers into one `div`, as direct children, keeping their labels and any
+sizes. Cards already in a row are marked *on one line*, so you can see the
+current layout. Then adjust the `div` by hand — change `gap`, the `max-height`,
+add a third figure, or drop the class.
+
+Two things worth knowing:
+
+* **Figures inside a `div` must be `<img>` tags.** Inside an HTML block a
+  markdown image is not parsed, so `![Q16 附图](…)` would print as literal text.
+  The generated row takes care of this; if you write a row by hand, write `<img>`.
+* **A row survives ✨ Clean up.** The DeepSeek prompt tells the model to drop
+  wrapper `div`s, so each row is swapped for one opaque `[[ROW1]]` marker before
+  the call and put back verbatim afterwards — like the figure markers, but for
+  the whole block. Anything the model drops is re-attached, and the task page
+  reports how many were recovered.
+
+Rows and hand edits live on the page, so a layout survives re-uploading figures,
+hosting them and downloading again.
+
+### Fixing a figure the OCR got wrong
+
+Layout detection is the weak link: it reads a diagram as prose, misses a small
+figure inside a paragraph, cuts a box in half, or files a patch of handwriting
+under "image" — and no amount of re-reading fixes it, because the same model
+runs again.
+
+So the engine does the easy figures first, and the review screen is where the
+rest get sorted out. Both kinds of figure live side by side, and the paper
+cannot tell them apart:
+
+| | found by the engine | drawn by you |
+|---|---|---|
+| how | the layout model boxes it | a rectangle you drag on the page photo |
+| cut from | the downscaled copy the model read | the original photo, full resolution |
+| stored in | the page's text | `manual_crops`, beside the OCR text |
+| removed with | **✕** (dropped from the paper) | **✕** (deleted, file and all) |
+
+**▭ Outline a figure** is the way out for whatever the engine missed: drag a
+rectangle on the page photo and the region becomes a real figure — numbered,
+dropped, and put on one line like any other. Because it is cut from the
+original photo it is also sharper than an engine crop of the same region, which
+is worth knowing when the two overlap.
+
+* **It is cut from the original photo**, at full resolution, not from the
+  downscaled copy the model sees — so a drawn figure is as sharp as the source.
+* **It is shown at the size of the rectangle you drew for it.** The cut is the
+  full-resolution photo region, which is thousands of pixels wide and would
+  sprawl across any screen, so the *displayed* size is the rectangle's share of
+  the page: a diagram drawn across half the page comes out across half the page,
+  at `FIGURE_PAGE_WIDTH` pixels wide as a whole page (800 by default, roughly A4
+  at 96 dpi). A figure that already carries a size of its own keeps it, and
+  `FIGURE_PAGE_WIDTH=0` turns sizing off entirely. The drag readout tells you
+  both numbers while you drag.
+* `FIGURE_MAX_WIDTH` / `FIGURE_MAX_HEIGHT` are only a ceiling, so a rectangle
+  covering the whole page cannot swallow the text around it.
+* **The size is written twice, deliberately** — as `style="max-width:416px"` *and*
+  as a plain `width="416"` attribute. Markdown viewers disagree about inline
+  CSS: some honour it, some strip it and show the figure at full size. The
+  attribute is honoured everywhere.
+* The rectangle is stored as fractions of the photo, so the browser's zoom and
+  window size never change what gets cut. `Shift` while dragging draws a square.
+* **Type a question number next to the button** and the figure is placed under
+  that question, exactly as typing it on a figure card would. Without one it lands
+  at the end of the page until you number it.
+* Afterwards it behaves like any other figure: numbered, dropped with **✕**, put
+  on one line with **⤢ One line**, hosted, downloaded. Cards of outlined figures
+  are marked *outlined*, and their **✕** removes the cut-out file rather than
+  merely hiding it.
+* **It survives reading the page again.** Outlined figures are stored beside the
+  OCR text rather than inside it, so a re-read — or a revert — cannot lose them.
+* Too small a box is refused rather than cut: `LAYOUT_PADDING` adds a 6 px margin
+  all round, so a stray click must not become a 12 × 12 "figure".
+
+A read writes the figures it found into the page's text, and any image reference
+a model volunteers when detection is *off* is removed instead, so a broken
+`<img>` cannot reach the download. **🔍 Detect handwriting** hides itself when
+there is nothing but outlined figures on the page: it exists to clean up figures
+the OCR found by itself.
+
+Turning detection off with `OCR_EXTRACT_FIGURES=0` writes no figure files at all,
+DeepSeek is never asked where the figures are, and the local layout model is
+never loaded — which also saves ~3.5 s a page.
+
+### Blanks
+
+A fill-in-the-blank is the one piece of LaTeX an exam paper is full of, and
+models write it straight into the prose — `（\underline{\hspace{2em}}）` between
+two words — where KaTeX never sees it, so the reader gets literal backslashes
+instead of a ruled space. The prompts ask for the blank inside `$...$`, and
+`markdown_utils.wrap_bare_latex` catches the ones that still are not: it wraps
+only fragments outside every math span, in `\(...\)` rather than `$...$` because
+a line can hold several blanks in a row and `$a$$b$` is ambiguous to read back.
+Like the figure sizing, it is applied when the paper is rendered, so pages
+already read are fixed without being read again.
+
 ### Cleanup
 
 Both engines leave you with printed questions only, but they get there
@@ -202,8 +336,14 @@ every figure for an opaque `[[FIG3-Q13]]` marker ("figure 3 belongs to question
 nor reattach a figure to the wrong question. Anything it drops is re-attached
 rather than lost, and the task page reports how many were recovered.
 
+A row of side-by-side figures — the flexbox `div` you may have built by hand —
+is protected the same way, but as one whole block (`[[ROW1]]`), so the model is
+handed a single token to copy instead of markup it would flatten. See
+[Figures on one line](#figures-on-one-line).
+
 Cleaned output is cached per task and **invalidated automatically** when a figure
-mapping changes, a page is retried, or more pages are uploaded.
+mapping changes, a page is hand-edited, a page is retried, or more pages are
+uploaded.
 
 **Should the page photo be sent too?** Measured: no. `deepseek-flash` accepts
 images, but on a handwriting-heavy page the image pass cost **2× the prompt
@@ -228,7 +368,8 @@ embedded in the paper. The cleanup cannot help: by then they are images, not tex
 * **Find them automatically** — **🔍 Detect handwriting** sends each figure to
   DeepSeek's vision model with one narrow question: printed material, or
   handwriting? Unassigned handwriting is marked for removal; a figure you already
-  gave a question number is only flagged, never deleted.
+  gave a question number is only flagged, never deleted. The button hides itself
+  when the page has no detected figures, since it has nothing to work with.
 
 That narrow question is where vision genuinely works — unlike the whole-page
 cleanup, where it measured *worse*. On real crops: a printed cylinder and a
@@ -241,6 +382,30 @@ Both controls write `drop` as the figure's mapping value, which
 `apply_labels_mapping()` acts on — the same place question numbers are applied,
 so deleting and labelling compose.
 
+### Reading one page again
+
+Sometimes a single page comes back wrong: a formula mangled, a figure missed, a
+diagram the layout model cut in half. **↻ Re-read** puts just that page back on
+the queue from its original photo — the rest of the paper is untouched.
+
+* **It works on a page that read fine.** `Retry` is for failed pages; re-reading
+  is for successful ones the engine got wrong.
+* **Pick the other engine.** DeepSeek reads at temperature 0, so asking it again
+  tends to give the same answer — a second opinion has to come from the other
+  engine. The picker sits next to the button (task page) or comes as the first
+  question (**Re-read page** in the review screen). The choice is pinned to that
+  page, so it survives a restart and applies to any later re-read.
+* **Your figure numbers are kept**; the text and the figures are replaced.
+* **Hand-edited markdown on that page is lost** — it was written against the text
+  this throws away. The confirmation says so. The cleaned paper is dropped too,
+  for the same reason.
+* **Figure filenames carry their crop coordinates**, so a new read may name its
+  figures differently, leaving your numbers pointing at figures the page no longer
+  has. The review screen lists exactly which ones, so they can be cleared or
+  re-typed.
+* A page already `queued` or `processing` is refused (`409`) — it is being read
+  right now. A page whose photo has been deleted is refused with "upload it again".
+
 ---
 
 ## Configuration
@@ -251,8 +416,12 @@ Copy `.env.example` to `.env` (the installer does this).
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `OCR_ENGINE` | `auto` | `auto` / `paddle` / `deepseek` — see [Engines](#engines). |
-| `LAYOUT_MODEL_NAME` | `PP-DocLayoutV3` | Layout model the `deepseek` engine uses for boxes. |
+| `OCR_ENGINE` | `auto` | `auto` / `paddle` / `deepseek` — see [Engines](#engines). One page can be pinned to a different engine when it is [read again](#reading-one-page-again). |
+| `OCR_EXTRACT_FIGURES` | `1` | Let OCR find and crop figures by itself; you outline whatever it missed with [▭ Outline a figure](#fixing-a-figure-the-ocr-got-wrong). `0` = you draw every figure. |
+| `FIGURE_PAGE_WIDTH` | `800` | How wide the whole page counts in the paper, in pixels. A figure is shown at the share of it that its rectangle covered. `0` = no sizing. |
+| `FIGURE_MAX_WIDTH` | `800` | Ceiling on any one figure's display width. `0` = no ceiling. |
+| `FIGURE_MAX_HEIGHT` | `1100` | Same, for height. |
+| `LAYOUT_MODEL_NAME` | `PP-DocLayoutV3` | Layout model used for boxes when `OCR_EXTRACT_FIGURES=1`. |
 | `LAYOUT_MIN_SCORE` | `0.5` | Ignore detections below this confidence. |
 | `LAYOUT_MIN_PIXELS` | `32` | A "figure" smaller than this is treated as a stray mark. |
 | `LAYOUT_PADDING` | `6` | Pixels of margin around each crop, so nothing is clipped. |
@@ -324,14 +493,15 @@ One process — no second service to keep alive.
 app/
   main.py            FastAPI routes + Jinja templates
   worker.py          OCR queue, worker threads, and the cleanup runner
-  ocr.py             engine dispatch: PaddleOCR-VL, or the hybrid
+  ocr.py             engine dispatch: PaddleOCR-VL, or DeepSeek reading the page
   pdf.py             PDF → page images (pypdfium2), blank skipping, provenance
-  layout.py          PP-DocLayoutV3 wrapper — the figure boxes, ~2.5 s locally
+  layout.py          PP-DocLayoutV3 wrapper — figure boxes, only loaded when
+                     OCR_EXTRACT_FIGURES=1
   deepseek.py        page reading, cleanup, and figure classification
   markdown_utils.py  normalisation, figure refs, question labelling, merging
   image_host.py      imgbb / local / base64 hosting with a per-task URL cache
   store.py           SQLite: tasks, pages, mappings, cached URLs, cleaned text
-templates/           index (upload), task (progress), edit (figure → question)
+templates/           index (upload), task (progress), edit (figures + markdown)
 static/              app.css, app.js, vendored marked + KaTeX (works offline)
 tools/               benchmarks, the DeepSeek probes, comparison helpers
 data/                runtime: paper2md.db, uploads/<task>/{pages,images,pdf}
@@ -339,9 +509,9 @@ data/                runtime: paper2md.db, uploads/<task>/{pages,images,pdf}
 
 **Flow.** Uploading a page writes a JPEG to `data/uploads/<task>/pages/` and
 queues a job. A worker thread resizes the photo (honouring EXIF rotation), runs
-the configured engine, copies cropped figures into `images/`, and stores the
-page's markdown. Task status is derived from its pages, so an interrupted run
-resumes: pages left mid-flight are re-queued on the next start.
+the configured engine, and stores the page's markdown together with the figures it
+found. Task status is derived from its pages, so an interrupted run resumes: pages
+left mid-flight are re-queued on the next start.
 
 **A PDF takes one short detour first.** `pdf.py` renders each page to that same
 JPEG with pypdfium2 and then hands it to the same queue — the original PDF is
@@ -365,6 +535,25 @@ against the correct reading, +0.04 against the swapped one).
 **Downloads** rebuild markdown from each page plus its mapping, wrap pages in
 `<!-- page N -->` markers, and rewrite figures to the configured host.
 
+**A hand-edited page overrides its own text.** Each page may also carry
+`edited_markdown`, saved from the review screen's markdown editor. When it is
+there it *is* the page; the mapping-derived version is kept alongside so
+**Revert to generated** is instant and lossless.
+
+**Everything reads one function.** `store.page_render_markdown(page)` is what the
+merge, the download, the hosting, the cleanup and the editor all go through, so a
+new kind of content only has to be described once. A page contributes its OCR
+text, its figure mapping, and — when the user has taken the text over — the
+hand-edited version instead. Figures outlined by hand live in a third column,
+`manual_crops`, and are appended *before* the mapping runs, which is what lets a
+drawn figure be numbered and placed like any other while still surviving a re-read.
+
+That one function is also where a figure's size is decided, from the rectangle it
+came out of — which is why the size follows `FIGURE_PAGE_WIDTH` everywhere at
+once, and why nothing is ever written into the text the user saved. The editor
+reads two fields back from it: `labelled_markdown` is the text, `preview` is the
+text as the paper shows it.
+
 ### HTTP surface
 
 **Pages** (HTML): `/` upload + task list · `/tasks/{id}` progress · `/tasks/{id}/edit` figure review.
@@ -380,9 +569,14 @@ against the correct reading, +0.04 against the swapped one).
 | `POST` | `/api/tasks/{id}/pdf` | Render a PDF's pages and queue them (continues page order) |
 | `POST` | `/api/convert/pdf` | Create a task and ingest a PDF in one call — `202`, then poll |
 | `POST` | `/api/tasks/{id}/pages/{n}/retry` | Re-run a failed page |
+| `POST` | `/api/tasks/{id}/pages/{n}/reread` | Read a page again (also a good one); optional `{"engine": "paddle"}` |
 | `GET` | `/api/tasks/{id}` | Status, per-page state, cleanup progress |
 | `GET` | `/api/tasks/{id}/pages/{n}` | Page markdown, mapping, figures, questions |
 | `PUT` | `/api/tasks/{id}/pages/{n}/mapping` | Save `{filename: "13"}` (or `"drop"`) |
+| `PUT` | `/api/tasks/{id}/pages/{n}/markdown` | Save the hand-edited page, or `{"reset": true}` |
+| `POST` | `/api/tasks/{id}/pages/{n}/figure-row` | Put `{figures: ["a.jpg","b.jpg"]}` on one line |
+| `POST` | `/api/tasks/{id}/pages/{n}/crop` | Cut `{x, y, w, h}` (fractions of the photo) into a figure |
+| `DELETE` | `/api/tasks/{id}/pages/{n}/crop/{file}` | Remove a figure the user outlined |
 | `POST` | `/api/tasks/{id}/pages/{n}/classify-figures` | Flag figures that are handwriting |
 | `POST` | `/api/tasks/{id}/host-images` | Upload figures, return hosted markdown |
 | `POST` | `/api/tasks/{id}/polish` | Start the cleanup — `202`, then poll |
@@ -445,9 +639,9 @@ What would still have to change is everything assuming a long-lived process:
    work.
 2. **No background worker** — the queue and worker threads do not survive
    serverless; each request would process its own page synchronously.
-3. **Figure boxes** — dropping Paddle loses PP-DocLayoutV3, so crops would come
-   from DeepSeek's approximate boxes. A hosted layout API would be needed to keep
-   current quality.
+3. **Figure boxes** — `PP-DocLayoutV3` is a local model, so the serverless path
+   would need a hosted layout API, and dropping Paddle drops it too. Figures the
+   user outlines by hand would still work unchanged.
 4. **No offline path** — every page would depend on the API.
 
 Roughly a day's work, mostly storage. Worth weighing against a small container
@@ -482,7 +676,7 @@ uncertain payoff on an integrated GPU.
 .venv/bin/pytest tests -q            # if you have pytest
 ```
 
-97 tests. The OCR engine, the layout model and the DeepSeek API are all stubbed,
+188 tests. The OCR engine, the layout model and the DeepSeek API are all stubbed,
 so the suite runs offline and fast, while the real app, database, worker threads,
 markdown pipeline, cropping, box matching and PDF rendering (a PDF is built on
 the fly and rendered by pypdfium2) are exercised for real.

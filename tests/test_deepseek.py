@@ -135,6 +135,121 @@ def test_empty_key_raises_a_clear_error():
         deepseek.config.DEEPSEEK_API_KEY = saved
 
 
+# --- layout rows (a flexbox div of side-by-side figures) ---------------------
+#
+# The cleanup prompt tells the model to drop wrapper divs, so a row the user
+# built by hand has to survive as one opaque token.
+
+ROW_PAGE = """13. 看图。
+
+<div class="p2md-row" style="display:flex; gap:12px;">
+<img src="https://i.ibb.co/aa1/a.jpg" alt="Q13 附图">
+<img src="https://i.ibb.co/bb2/b.jpg" alt="Q13 附图2">
+</div>
+
+14. 别的题。
+
+![Q14 附图](https://i.ibb.co/cc3/c.jpg)
+"""
+
+
+def test_rows_are_hidden_from_the_model_whole():
+    protected, mapping = deepseek.protect_rows(ROW_PAGE)
+    # Neither the layout nor the hosted URLs are visible to the model.
+    assert "i.ibb.co/aa1" not in protected
+    assert "display:flex" not in protected
+    assert "[[ROW1]]" in protected
+    assert len(mapping) == 1
+    # The one figure outside the row is still a figure, for the figure pass.
+    assert "i.ibb.co/cc3" in protected
+
+
+def test_row_round_trip_is_lossless():
+    protected, mapping = deepseek.protect_rows(ROW_PAGE)
+    restored, missing = deepseek.restore_rows(protected, mapping)
+    assert missing == []
+    assert restored == ROW_PAGE
+
+
+def test_a_row_the_model_moved_goes_where_the_model_put_it():
+    protected, mapping = deepseek.protect_rows(ROW_PAGE)
+    moved = "13. 看图。\n\n14. 别的题。\n\n[[ROW1]]\n"
+    restored, missing = deepseek.restore_rows(moved, mapping)
+    assert missing == []
+    assert restored.index("i.ibb.co/aa1") > restored.index("别的题")
+
+
+def test_a_row_the_model_dropped_is_recovered_not_lost():
+    protected, mapping = deepseek.protect_rows(ROW_PAGE)
+    restored, missing = deepseek.restore_rows("13. 看图。\n", mapping)
+    assert missing == ["[[ROW1]]"]
+    assert "i.ibb.co/aa1" in restored and "i.ibb.co/bb2" in restored
+
+
+def test_unknown_row_marker_is_stripped():
+    _protected, mapping = deepseek.protect_rows(ROW_PAGE)
+    restored, _missing = deepseek.restore_rows("text\n\n[[ROW9]]\n", mapping)
+    assert "ROW9" not in restored
+
+
+def test_a_row_nested_in_another_row_is_one_row():
+    nested = '<div style="display:flex;">\n<div style="display:flex;"><img src="a.jpg"></div>\n<img src="b.jpg">\n</div>'
+    protected, mapping = deepseek.protect_rows(nested)
+    assert len(mapping) == 1
+    assert protected.strip() == "[[ROW1]]"
+    assert deepseek.restore_rows(protected, mapping)[0] == nested
+
+
+def test_no_rows_is_a_no_op():
+    page = "1. Just text.\n"
+    assert deepseek.protect_rows(page) == (page, {})
+
+
+def test_polish_keeps_a_row_through_the_model_call():
+    """End to end: the cleaned paper still has the row, div and all."""
+    saved_post = deepseek.requests.post
+    saved_key = deepseek.config.DEEPSEEK_API_KEY
+    saved_limit = deepseek.config.DEEPSEEK_MAX_CHARS
+    deepseek.config.DEEPSEEK_API_KEY = "test-key"
+    deepseek.config.DEEPSEEK_MAX_CHARS = 100000
+    sent = {}
+
+    class _Stream:
+        status_code = 200
+        ok = True
+        text = ""
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def iter_lines(self, decode_unicode=False):
+            yield 'data: {"choices":[{"delta":{"content":"13. 看图。\\n\\n[[ROW1]]\\n\\n14. 别的题。"}}]}'
+            yield "data: [DONE]"
+
+    def fake_post(url, **kwargs):
+        sent["payload"] = kwargs["json"]["messages"][1]["content"]
+        return _Stream()
+
+    deepseek.requests.post = fake_post
+    try:
+        cleaned, info = deepseek.polish_markdown(ROW_PAGE)
+    finally:
+        deepseek.requests.post = saved_post
+        deepseek.config.DEEPSEEK_API_KEY = saved_key
+        deepseek.config.DEEPSEEK_MAX_CHARS = saved_limit
+
+    # The model only ever saw the marker.
+    assert "[[ROW1]]" in sent["payload"]
+    assert "display:flex" not in sent["payload"]
+    # ...and the row came back byte-for-byte.
+    assert '<div class="p2md-row"' in cleaned
+    assert cleaned.index("i.ibb.co/aa1") < cleaned.index("i.ibb.co/bb2")
+    assert info["rows_total"] == 1 and info["rows_recovered"] == 0
+
+
 # --- streaming transport (mocked; no network) --------------------------------
 
 
@@ -323,6 +438,80 @@ def test_soft_fraction_is_monotonic_and_never_completes():
     assert all(f < 1.0 for f in fractions), "must never claim completion on its own"
     assert fractions[-1] > 0.9, "should end up near the end"
     assert deepseek._soft_fraction(0, 0) == 0.0
+
+
+# --- reading a page without being asked about figures -----------------------
+
+
+def _read_page_with(content, **kwargs):
+    """Call read_page against a stubbed API and return (markdown, figures, prompt)."""
+    import tempfile
+    from pathlib import Path
+
+    from PIL import Image
+
+    page = Path(tempfile.mkdtemp(prefix="page-")) / "page.jpg"
+    Image.new("RGB", (40, 60), "white").save(page, format="JPEG")
+
+    sent: dict = {}
+
+    class _Response:
+        def __init__(self, body):
+            self._body = body
+            self.ok = True
+            self.status_code = 200
+            self.text = ""
+
+        def json(self):
+            return self._body
+
+    saved_post = deepseek.requests.post
+    saved_key = deepseek.config.DEEPSEEK_API_KEY
+
+    def fake_post(url, headers=None, json=None, timeout=None, **k):
+        sent["payload"] = json
+        return _Response(
+            {
+                "choices": [{"message": {"content": content}, "finish_reason": "stop"}],
+                "usage": {},
+            }
+        )
+
+    try:
+        deepseek.requests.post = fake_post
+        deepseek.config.DEEPSEEK_API_KEY = "test-key"
+        markdown, figures = deepseek.read_page(page, model="test-model", **kwargs)
+    finally:
+        deepseek.requests.post = saved_post
+        deepseek.config.DEEPSEEK_API_KEY = saved_key
+
+    prompt = sent["payload"]["messages"][0]["content"][0]["text"]
+    return markdown, figures, prompt
+
+
+def test_reading_a_page_without_figures_asks_for_no_figure_boxes():
+    markdown, figures, prompt = _read_page_with(
+        "9. Simplify $x+y$.\n", figures=False
+    )
+    assert markdown == "9. Simplify $x+y$."
+    assert figures == []
+    assert "FIGURES" not in prompt, "the question must not be asked at all"
+    assert "<img>" in prompt, "it says outright not to write one"
+    assert "by hand" in prompt
+
+
+def test_reading_a_page_with_figures_still_asks_for_them():
+    body = '{"markdown": "9. Simplify.", "figures": [{"x1": 1, "y1": 2, "x2": 3, "y2": 4, "question": "9"}]}'
+    markdown, figures, prompt = _read_page_with(body)
+    assert "PART 2 - FIGURES" in prompt
+    assert figures == [{"x1": 1, "y1": 2, "x2": 3, "y2": 4, "question": "9"}]
+
+
+def test_a_fenced_reply_is_unwrapped_even_when_no_json_was_asked_for():
+    markdown, _figures, _prompt = _read_page_with(
+        "```markdown\n9. Simplify $x+y$.\n```", figures=False
+    )
+    assert markdown == "9. Simplify $x+y$."
 
 
 # --- figure classification (mocked; no network) ------------------------------

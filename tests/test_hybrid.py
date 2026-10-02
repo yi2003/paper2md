@@ -203,6 +203,154 @@ def test_hybrid_returns_cleanly_when_there_are_no_figures():
     assert "<img" not in markdown
 
 
+# --- text-only reading: figures are drawn by hand -----------------------------
+#
+# OCR_EXTRACT_FIGURES is off by default, so these check that nothing looks for
+# figures: no layout model, no crops, no question hints, and no image reference
+# left over from a model that had ideas of its own.
+
+
+def test_text_only_reading_never_loads_the_layout_model():
+    page = _page()
+    work = page.parent / "work"
+    images = page.parent / "images"
+    images.mkdir()
+
+    asked = []
+
+    def explode(path):
+        raise AssertionError("the layout model must not be loaded to find figures")
+
+    saved_layout = ocr.layout.detect
+    saved_read = ocr.deepseek.read_page
+    try:
+        ocr.layout.detect = explode
+
+        def read(path, model=None, figures=True):
+            asked.append(figures)
+            return "9. Simplify $x+y$.\n", []
+
+        ocr.deepseek.read_page = read
+        markdown, figures, mapping = ocr.run_ocr_hybrid(
+            page, work, images, "p1_", extract=False
+        )
+    finally:
+        ocr.layout.detect = saved_layout
+        ocr.deepseek.read_page = saved_read
+
+    assert asked == [False], "DeepSeek must not be asked where the figures are"
+    assert figures == [] and mapping == {}
+    assert "9. Simplify" in markdown
+    assert list(images.iterdir()) == [], "no figure file is written"
+
+
+def test_an_image_the_model_adds_by_itself_is_removed():
+    """DeepSeek does emit figure references even when nothing asks it to."""
+    page = _page()
+    work = page.parent / "work"
+    images = page.parent / "images"
+    images.mkdir()
+
+    saved_read = ocr.deepseek.read_page
+    try:
+        ocr.deepseek.read_page = lambda path, model=None, figures=True: (
+            '9. Simplify $x+y$.\n\n<img src="images/made_up.jpg">\n\n16. Explain.\n',
+            [],
+        )
+        markdown, figures, _ = ocr.run_ocr_hybrid(page, work, images, "p1_", extract=False)
+    finally:
+        ocr.deepseek.read_page = saved_read
+
+    assert "made_up" not in markdown, "a reference with no file behind it is a broken image"
+    assert figures == []
+    assert "9. Simplify" in markdown and "16. Explain" in markdown
+
+
+def test_the_engine_is_told_from_the_config_whether_to_find_figures():
+    """The switch has to reach both engines from one setting."""
+    from app import config
+
+    saved_engine = config.OCR_ENGINE
+    saved_extract = config.OCR_EXTRACT_FIGURES
+    saved_hybrid = ocr.run_ocr_hybrid
+    saved_paddle = ocr.run_ocr_paddle
+    page = _page()
+    seen: dict[str, list] = {}
+
+    def spy(key):
+        def record(*a, **k):
+            seen.setdefault(key, []).append(k.get("extract"))
+            return "x", [], {}
+
+        return record
+
+    try:
+        ocr.run_ocr_hybrid = spy("hybrid")
+        ocr.run_ocr_paddle = spy("paddle")
+
+        config.OCR_EXTRACT_FIGURES = False
+        config.OCR_ENGINE = "deepseek"
+        ocr.run_ocr(page, page.parent, page.parent, "")
+        config.OCR_ENGINE = "paddle"
+        ocr.run_ocr(page, page.parent, page.parent, "")
+
+        config.OCR_EXTRACT_FIGURES = True
+        config.OCR_ENGINE = "deepseek"
+        ocr.run_ocr(page, page.parent, page.parent, "")
+    finally:
+        config.OCR_ENGINE = saved_engine
+        config.OCR_EXTRACT_FIGURES = saved_extract
+        ocr.run_ocr_hybrid = saved_hybrid
+        ocr.run_ocr_paddle = saved_paddle
+
+    assert seen == {"hybrid": [False, True], "paddle": [False]}, (
+        "the old behaviour has to stay one env var away"
+    )
+
+
+def test_paddle_throws_away_the_figures_it_cut_out():
+    page = _page()
+    work = page.parent / "work"
+    images = page.parent / "images"
+    images.mkdir()
+
+    class _Result:
+        def save_to_markdown(self, save_path):
+            # PaddleOCR-VL writes the page out and puts its crops beside it.
+            (Path(save_path) / "page.md").write_text(
+                "9. Simplify $x+y$.\n\n![](images/crop1.jpg)\n", encoding="utf-8"
+            )
+            (Path(save_path) / "crop1.jpg").write_bytes(b"not really a jpeg")
+
+    class _Pipeline:
+        def predict(self, *a, **k):
+            return [_Result()]
+
+    saved_pipeline = ocr.get_pipeline
+    try:
+        ocr.get_pipeline = lambda: _Pipeline()
+        markdown, figures, mapping = ocr.run_ocr_paddle(
+            page, work, images, "p1_", extract=False
+        )
+    finally:
+        ocr.get_pipeline = saved_pipeline
+
+    assert "9. Simplify" in markdown
+    assert "crop1" not in markdown, "the reference goes with the file"
+    assert figures == [] and mapping == {}
+    assert list(images.iterdir()) == [], "nothing is copied out of the work directory"
+
+    # The same page with extraction on still keeps its figures.
+    saved_pipeline = ocr.get_pipeline
+    try:
+        ocr.get_pipeline = lambda: _Pipeline()
+        markdown, figures, _ = ocr.run_ocr_paddle(page, work / "b", images, "p1_", extract=True)
+    finally:
+        ocr.get_pipeline = saved_pipeline
+    assert figures == ["p1_crop1.jpg"]
+    assert (images / "p1_crop1.jpg").is_file()
+
+
 # --- engine dispatch ---------------------------------------------------------
 
 

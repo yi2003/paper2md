@@ -93,7 +93,35 @@ OCR_DEBUG = _bool("OCR_DEBUG", False)
 #              handwriting goes in the same pass, but it needs the API.
 #   auto     - try DeepSeek, fall back to Paddle if it fails.
 
-OCR_ENGINE = _str("OCR_ENGINE", "paddle").lower()
+OCR_ENGINE = _str("OCR_ENGINE", "auto").lower()
+
+# What OCR_ENGINE may be, and what a single page may be pinned to for a re-read.
+OCR_ENGINES = ("auto", "deepseek", "paddle")
+
+# Should OCR find figures on its own?
+#
+# Off by default: every figure in the paper is one the user drew on the page
+# photo with the review screen's outlining tool. That is deliberate — a layout
+# model cannot tell a diagram from a patch of handwriting, and a half-clipped
+# crop is worse than no crop. With this off, neither engine writes a figure
+# file, DeepSeek is not even asked where the figures are, and the local layout
+# model is never loaded (saving ~3.5 s a page).
+OCR_EXTRACT_FIGURES = _bool("OCR_EXTRACT_FIGURES", False)
+
+# How large a figure may look in the finished paper, in pixels.
+#
+# An outlined figure is cut from the original photo at full resolution, which is
+# what you want if you ever zoom into it and useless if the diagram sprawls
+# across three screens of Markdown. So a figure is shown at the size of the
+# rectangle it was cut from, measured against the page: FIGURE_PAGE_WIDTH is
+# how wide the whole page counts as in the paper (A4 at 96 dpi is about 794),
+# and a diagram drawn across half the page is half that wide.
+#
+# The two values below are only a ceiling, so a rectangle covering the entire
+# page cannot swallow one. Set either to 0 to lift that cap.
+FIGURE_PAGE_WIDTH = _int("FIGURE_PAGE_WIDTH", 800)
+FIGURE_MAX_WIDTH = _int("FIGURE_MAX_WIDTH", 800)
+FIGURE_MAX_HEIGHT = _int("FIGURE_MAX_HEIGHT", 1100)
 
 # PP-DocLayoutV3 is the layout half of PaddleOCR-VL, used by the deepseek engine.
 LAYOUT_MODEL_NAME = _str("LAYOUT_MODEL_NAME", "PP-DocLayoutV3")

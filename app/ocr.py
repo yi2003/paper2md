@@ -16,7 +16,12 @@ from pathlib import Path
 from . import config, deepseek, layout
 from .deepseek import DeepSeekError
 from .layout import LayoutError
-from .markdown_utils import apply_labels_mapping, iter_image_refs, normalize_markdown
+from .markdown_utils import (
+    apply_labels_mapping,
+    iter_image_refs,
+    normalize_markdown,
+    strip_figures,
+)
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
 
@@ -133,6 +138,7 @@ def run_ocr(
     work_dir: Path,
     images_dir: Path,
     prefix: str = "",
+    engine: str | None = None,
 ) -> tuple[str, list[str]]:
     """OCR a single page using the configured engine.
 
@@ -141,25 +147,37 @@ def run_ocr(
                    text (see :func:`run_ocr_hybrid`).
     ``auto``     — DeepSeek, falling back to Paddle if it fails.
 
+    ``engine`` overrides ``OCR_ENGINE`` for this one page, which is what a re-read
+    uses: DeepSeek reads at temperature 0, so asking it again tends to reproduce
+    the same answer, whereas the other engine is a genuinely second opinion on a
+    page the first one got wrong.
+
     Returns ``(markdown, figure_filenames, suggested_mapping)``. The markdown
     references figures as ``images/<prefixed filename>``; ``suggested_mapping``
     is ``{filename: "13"}`` for engines that can work out the question numbers
     themselves, and is empty otherwise. Labels are never baked into the markdown
     — they are applied at render time from the stored mapping, so the format can
     change and the user can override it.
+
+    ``OCR_EXTRACT_FIGURES`` decides whether any of that happens at all. It is off
+    by default: no engine looks for figures, no figure file is written, and the
+    figures in the paper are the ones the user drew on the page photo. The
+    setting is read per page rather than captured at import, so changing it and
+    re-reading one page is enough to compare the two.
     """
-    engine = config.OCR_ENGINE
+    engine = engine or config.OCR_ENGINE
+    extract = config.OCR_EXTRACT_FIGURES
 
     if engine == "deepseek":
-        return run_ocr_hybrid(image_path, work_dir, images_dir, prefix)
+        return run_ocr_hybrid(image_path, work_dir, images_dir, prefix, extract=extract)
 
     if engine == "auto":
         try:
-            return run_ocr_hybrid(image_path, work_dir, images_dir, prefix)
+            return run_ocr_hybrid(image_path, work_dir, images_dir, prefix, extract=extract)
         except (DeepSeekError, LayoutError) as exc:
             log(f"deepseek engine failed ({exc}); falling back to PaddleOCR-VL")
 
-    return run_ocr_paddle(image_path, work_dir, images_dir, prefix)
+    return run_ocr_paddle(image_path, work_dir, images_dir, prefix, extract=extract)
 
 
 def run_ocr_paddle(
@@ -167,6 +185,7 @@ def run_ocr_paddle(
     work_dir: Path,
     images_dir: Path,
     prefix: str = "",
+    extract: bool = True,
 ) -> tuple[str, list[str]]:
     """OCR a single page with PaddleOCR-VL.
 
@@ -175,6 +194,9 @@ def run_ocr_paddle(
         work_dir: scratch directory (removed by the caller).
         images_dir: where extracted figures are copied.
         prefix: prepended to every figure filename so pages never collide.
+        extract: when false, PaddleOCR-VL still reads the text but its figures
+            are discarded — nothing is copied out and no reference survives, so
+            the page carries text only and the figures are drawn by hand.
 
     Returns:
         ``(markdown, figure_filenames)``. Markdown references figures as
@@ -201,6 +223,14 @@ def run_ocr_paddle(
     if markdown_path is None:
         raise OcrError("PaddleOCR-VL produced no Markdown output")
     markdown = normalize_markdown(markdown_path.read_text(encoding="utf-8"))
+
+    if not extract:
+        # The model cut whatever it liked out of the page; none of it is wanted.
+        # The files stay in the work directory, which the caller deletes.
+        dropped = len(list(iter_image_refs(markdown)))
+        markdown = strip_figures(markdown)
+        log(f"markdown {len(markdown):,} chars, {dropped} figure(s) discarded")
+        return markdown, [], {}
 
     # Every image the model wrote out, keyed by basename.
     extracted: dict[str, Path] = {}
@@ -334,12 +364,26 @@ def run_ocr_hybrid(
     work_dir: Path,
     images_dir: Path,
     prefix: str = "",
+    extract: bool = True,
 ) -> tuple[str, list[str]]:
-    """Local layout detection for the boxes, DeepSeek for the text."""
+    """Local layout detection for the boxes, DeepSeek for the text.
+
+    With ``extract=False`` this is a plain DeepSeek page read: the layout model
+    is never loaded, DeepSeek is not asked where the figures are, and nothing is
+    cropped.
+    """
     work_dir.mkdir(parents=True, exist_ok=True)
     images_dir.mkdir(parents=True, exist_ok=True)
 
     prepared = prepare_input(image_path, work_dir / "input.jpg")
+
+    if not extract:
+        # Text only. No layout model, no boxes, no crops.
+        markdown, _hints = deepseek.read_page(prepared, figures=False)
+        markdown = strip_figures(markdown)
+        log(f"markdown {len(markdown):,} chars, figures left to be drawn by hand")
+        return markdown, [], {}
+
     from PIL import Image
 
     with Image.open(prepared) as image:

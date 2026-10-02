@@ -24,6 +24,17 @@
     Auto-fill: match detected
   </button>
   <button id="clearBtn">Clear numbers</button>
+  <button id="rereadBtn" title="Read this page again from its original photo — for text or figures the engine got wrong">
+    ↻ Re-read page
+  </button>
+  <button id="mdToggleBtn" aria-expanded="false"
+          title="Edit this page's markdown by hand — add a div, move figures into it, retype anything">
+    ✎ Markdown
+  </button>
+  <button id="cropToggleBtn" aria-expanded="false"
+          title="Draw a box on the page photo to add a figure the layout model missed">
+    ▭ Outline a figure
+  </button>
 
   <span class="spacer"></span>
   <span class="muted" id="saveState">saved</span>
@@ -60,18 +71,104 @@
       </div>
       <div class="preview" id="preview"></div>
     </div>
+
+    <div class="panel md-panel" id="mdPanel" hidden>
+      <div class="md-head">
+        <strong style="font-size:14px">Markdown</strong>
+        <span class="muted" id="mdState">the page exactly as saved — this is what the .md contains</span>
+        <span class="spacer" style="flex:1"></span>
+        <button id="mdSaveBtn" class="primary">Save</button>
+        <button id="mdResetBtn" title="Throw away these edits and use the OCR text plus the figure numbers again">
+          Revert to generated
+        </button>
+      </div>
+      <textarea id="mdSource" class="md-source" spellcheck="false"
+                placeholder="Edit freely — for example wrap two figures in one line:
+
+&lt;div style=&quot;display:flex; gap:12px;&quot;&gt;
+  &lt;img src=&quot;images/a.jpg&quot;&gt;
+  &lt;img src=&quot;images/b.jpg&quot;&gt;
+&lt;/div&gt;"></textarea>
+      <p class="hint" style="margin:8px 0 0">
+        Figures inside a markdown <code>&lt;div&gt;</code> must be written as
+        <code>&lt;img&gt;</code> tags — a <code>![…](…)</code> image is not parsed inside an HTML
+        block and would print as plain text. Use <b>⤢ One line</b> below to have the row built
+        for you, then adjust it here.
+      </p>
+    </div>
+
+    <div class="panel crop-panel" id="cropPanel" hidden>
+      <div class="md-head">
+        <strong style="font-size:14px">Outline a figure</strong>
+        <span class="muted">for a diagram, table or graph the layout model missed</span>
+        <span class="spacer" style="flex:1"></span>
+        <label class="crop-q" title="Put the new figure under this question">
+          question
+          <input type="text" id="cropQuestion" placeholder="13" size="4" autocomplete="off">
+        </label>
+        <button id="cropAddBtn" class="primary" disabled>Add figure</button>
+        <button id="cropClearBtn" disabled>Clear box</button>
+      </div>
+
+      <div class="crop-stage" id="cropStage">
+        <img id="cropPhoto" alt="the page photo, for drawing on"
+             src="/tasks/{{ task.id }}/pages/{{ page_index }}/raw" draggable="false">
+        <div class="crop-box" id="cropBox" hidden></div>
+      </div>
+      <p class="hint" id="cropInfo" style="margin:8px 0 0">
+        Drag across the photo to draw a rectangle, then press <b>Add figure</b>.
+        Hold <kbd>Shift</kbd> for a square. It is cut from the original photo at full
+        size, and becomes a figure you can number, drop, or put on one line.
+        {% if extract_figures %}
+        Use it for a figure the OCR <b>missed</b> or cut wrongly — it sits alongside
+        the ones it found, and neither kind is treated differently.
+        {% endif %}
+      </p>
+      {% if figure_page_width %}
+      <p class="hint" style="margin:4px 0 0">
+        A figure is cut from the photo at full resolution but shown in the paper at the
+        size of the rectangle you drew for it: a diagram across half the page stays
+        across half the page. The whole page counts as
+        {{ figure_page_width or "no fixed width (sizing is off)" }} px here.
+      </p>
+      {% endif %}
+    </div>
   </section>
 
   <aside>
     <div class="panel">
       <h2>Figures on this page</h2>
+      {% if extract_figures %}
       <p class="hint">
-        Type the question number each figure belongs to — changes save automatically
-        and the figure moves under that question in the preview.
-        OCR sometimes cuts a patch of <b>handwriting</b> out as a figure: press
-        <b>✕</b> to delete one, or use <b>Detect handwriting</b> to find them all.
+        OCR cut these out for you. Type the question number each figure belongs
+        to — changes save automatically and the figure moves under that question
+        in the preview. It sometimes cuts a patch of <b>handwriting</b> out as a
+        figure: press <b>✕</b> to delete one, or use <b>Detect handwriting</b>
+        to find them all. A figure it <b>missed</b>, or cut wrongly, is yours to
+        fix: draw it with <b>▭ Outline a figure</b>.
       </p>
+      {% else %}
+      <p class="hint">
+        Figures are <b>not</b> detected for you — draw each one with
+        <b>▭ Outline a figure</b>, then type the question number it belongs to:
+        changes save automatically and the figure moves under that question in the
+        preview. <b>✕</b> removes an outlined figure and its file.
+      </p>
+      {% endif %}
+      <p class="hint warn-line" id="manualNote" hidden>
+        This page is <b>hand-edited</b>: its markdown is used exactly as saved, so the
+        question numbers and <b>✕</b> below only take effect after
+        <b>Revert to generated</b>.
+      </p>
+      <p class="hint warn-line" id="staleNote" hidden></p>
       <div class="questions" id="questionChips"></div>
+      <div class="figures-actions">
+        <button id="rowBtn" disabled
+                title="Move the marked figures into one flexbox div, so they sit on a single line">
+          ⤢ One line (0)
+        </button>
+        <span class="muted">mark figures with <b>⇄</b>, then put them on one line</span>
+      </div>
       <div class="figures" id="figures" style="margin-top:12px"></div>
     </div>
   </aside>
@@ -82,15 +179,36 @@
 <script>
 const TASK_ID = {{ task.id | tojson }};
 const PAGE_INDEX = {{ page_index | tojson }};
+const ENGINES = {{ ocr_engines | tojson }};
+const DEFAULT_ENGINE = {{ page_engine | tojson }};
+// Whether OCR looks for figures by itself. When it does not, the review screen
+// says so rather than talking about figures the page does not have.
+const EXTRACT_FIGURES = {{ extract_figures | tojson }};
 
 const previewEl = document.getElementById("preview");
 const figuresEl = document.getElementById("figures");
 const chipsEl = document.getElementById("questionChips");
 const saveState = document.getElementById("saveState");
+const mdPanel = document.getElementById("mdPanel");
+const mdSource = document.getElementById("mdSource");
+const mdStateEl = document.getElementById("mdState");
+const manualNote = document.getElementById("manualNote");
+const rowBtn = document.getElementById("rowBtn");
 
 let figureNames = [];     // filenames, in document order
 let detectedQuestions = [];
 let saveTimer = null;
+
+// The page as the server has it: what it says, what the OCR produced, and
+// whether the user has taken the text over.
+let page = { markdown: "", preview: "", generated: "", edited: false };
+let rowFigures = [];      // filenames already sitting in a one-line row
+let rowPick = [];         // filenames marked for the next row
+let mdDirty = false;      // unsaved typing in the markdown editor
+let staleFigures = [];    // numbers pointing at figures a re-read removed
+let cropNames = [];       // figures the user outlined on the photo themselves
+const MIN_CROP_PX = 12;   // matches the server's floor for a usable figure
+const PAGE_WIDTH = {{ figure_page_width or 0 }};   // how wide a full page counts in the paper
 
 /* ---------------------------------------------------------------- render */
 
@@ -105,6 +223,50 @@ function decoratePreview() {
 function showMarkdown(markdown) {
   renderMarkdown(previewEl, markdown);
   decoratePreview();
+}
+
+// Take a payload from any of the page endpoints and apply it everywhere.
+function applyPageState(payload) {
+  if (!payload) return;
+  // `markdown` is the text the editor edits and saving stores; `preview` is the
+  // same text as the paper shows it, with the figure display sizes applied.
+  if (typeof payload.markdown === "string") page.markdown = payload.markdown;
+  if (typeof payload.preview === "string") page.preview = payload.preview;
+  else page.preview = payload.markdown ?? page.preview;
+  if (typeof payload.generated_markdown === "string") {
+    page.generated = payload.generated_markdown;
+  }
+  page.edited = !!payload.edited;
+  if (Array.isArray(payload.row_figures)) rowFigures = payload.row_figures;
+
+  showMarkdown(page.preview);
+  if (mdPanel.hidden === false && !mdDirty) mdSource.value = page.markdown;
+  updateManualNote();
+  markRowFigures();
+}
+
+function updateManualNote() {
+  manualNote.hidden = !page.edited;
+  if (page.edited) {
+    mdStateEl.textContent = "hand-edited — saved, this is what the .md contains";
+    mdSource.placeholder = "Edit freely. Save to keep, Revert to go back to the OCR text.";
+  } else {
+    mdStateEl.textContent = "not saved yet — changes are only kept once you press Save";
+  }
+}
+
+const staleNote = document.getElementById("staleNote");
+
+// Figure numbers left over from an earlier read: their figure is not on this
+// page any more, so the number does nothing until it is cleared or re-typed.
+function renderStaleNote(names) {
+  staleFigures = names || [];
+  staleNote.hidden = staleFigures.length === 0;
+  if (!staleFigures.length) return;
+  staleNote.innerHTML =
+    `<b>${staleFigures.length}</b> figure number(s) point at figures this page does not have ` +
+    `(<span class="mono">${staleFigures.map(escapeHtml).join("</span>, <span class=\"mono\">")}</span>) — ` +
+    `left over from an earlier read. Clear them with <b>Clear numbers</b>, or type the number on the new figure.`;
 }
 
 // The mapping value that means "delete this figure" — must match DROP_VALUES
@@ -143,31 +305,104 @@ function figureCard(name, index) {
   input.addEventListener("blur", () => saveMapping({ immediate: true }));
 
   // Delete this figure outright — for regions the OCR mistook for a diagram.
+  // A figure the user outlined is removed rather than "dropped": dropping would
+  // only hide it until the numbers were cleared, and bring it straight back.
   const dropBtn = document.createElement("button");
   dropBtn.type = "button";
   dropBtn.dataset.role = "drop";
   dropBtn.textContent = "✕";
-  dropBtn.title = "Delete this figure from the paper";
-  dropBtn.addEventListener("click", () => {
+  const handDrawn = cropNames.includes(name);
+  dropBtn.title = handDrawn
+    ? "Remove this outlined figure"
+    : "Delete this figure from the paper";
+  dropBtn.addEventListener("click", async () => {
+    if (handDrawn) {
+      dropBtn.disabled = true;
+      try {
+        await api(
+          `/api/tasks/${TASK_ID}/pages/${PAGE_INDEX}/crop/${encodeURIComponent(name)}`,
+          { method: "DELETE" }
+        );
+        saveState.textContent = "saved";
+        await refreshPage();
+      } catch (error) {
+        toast(error.message, true);
+        dropBtn.disabled = false;
+      }
+      return;
+    }
     input.value = isDropped(input.value) ? "" : DROP;
     markAssigned();
     saveMapping({ immediate: true });
+  });
+
+  // Mark this figure for the next one-line row.
+  const rowBtnEl = document.createElement("button");
+  rowBtnEl.type = "button";
+  rowBtnEl.dataset.role = "row";
+  rowBtnEl.textContent = "⇄";
+  rowBtnEl.title = "Mark this figure, then press “One line” to put the marked figures side by side";
+  rowBtnEl.addEventListener("click", () => {
+    const name = card.dataset.name;
+    rowPick = rowPick.includes(name)
+      ? rowPick.filter((item) => item !== name)
+      : rowPick.concat(name);
+    markRowFigures();
   });
 
   const kind = document.createElement("span");
   kind.className = "kind";
   kind.dataset.role = "kind";
 
-  row.append(label, input, dropBtn);
-  body.append(filename, row, kind);
+  const rowMark = document.createElement("span");
+  rowMark.className = "rowmark";
+  rowMark.dataset.role = "rowmark";
+  if (handDrawn) {
+    card.classList.add("hand");
+    const badge = document.createElement("span");
+    badge.className = "handbadge";
+    badge.textContent = "outlined";
+    badge.title = "You drew this box on the page photo";
+    filename.appendChild(badge);
+  }
+
+  row.append(label, input, dropBtn, rowBtnEl);
+  body.append(filename, row, kind, rowMark);
   card.append(image, body);
   return card;
 }
 
+// Show which figures are already on one line, and which are marked for the
+// next one. Cards keep their own state so a mapping save never clears the marks.
+function markRowFigures() {
+  figuresEl.querySelectorAll(".figure").forEach((card) => {
+    const name = card.dataset.name;
+    const picked = rowPick.includes(name);
+    const inRow = rowFigures.includes(name);
+    card.classList.toggle("picked", picked);
+    card.classList.toggle("in-row", inRow);
+    card.querySelector('[data-role="row"]').classList.toggle("on", picked);
+    const mark = card.querySelector('[data-role="rowmark"]');
+    mark.textContent = inRow ? (picked ? "in a row · marked" : "on one line") : (picked ? "marked for one line" : "");
+    mark.classList.toggle("on", picked);
+  });
+
+  const count = rowPick.length;
+  rowBtn.textContent = `⤢ One line (${count})`;
+  rowBtn.disabled = count < 2;
+  rowBtn.title = count < 2
+    ? "Mark at least two figures with ⤢ to put them side by side"
+    : `Put ${count} figures on one line, in this order`;
+}
+
 function renderFigures(names, mapping) {
   figuresEl.innerHTML = "";
+  updateDetectedTools(names);
   if (!names.length) {
-    figuresEl.innerHTML = '<p class="empty">No figures found on this page.</p>';
+    figuresEl.innerHTML = EXTRACT_FIGURES
+      ? '<p class="empty">No figures found on this page.</p>'
+      : '<p class="empty">No figures on this page — nothing was detected for you. ' +
+        'Draw the ones you need with <b>▭ Outline a figure</b> above.</p>';
     return;
   }
   names.forEach((name, index) => {
@@ -176,6 +411,15 @@ function renderFigures(names, mapping) {
     figuresEl.appendChild(card);
   });
   markAssigned();
+  markRowFigures();
+}
+
+// The handwriting detector exists to clean up figures the OCR found by itself.
+// With every figure drawn by hand there is nothing for it to look at, so it is
+// hidden rather than left there to come back with an empty answer.
+function updateDetectedTools(names) {
+  const detected = names.filter((name) => !cropNames.includes(name));
+  if (detectBtn) detectBtn.hidden = detected.length === 0;
 }
 
 function renderChips() {
@@ -237,13 +481,320 @@ async function saveMapping({ immediate = false } = {}) {
       `/api/tasks/${TASK_ID}/pages/${PAGE_INDEX}/mapping`,
       jsonRequest("PUT", mapping)
     );
-    showMarkdown(result.markdown);
+    applyPageState(result);
     saveState.textContent = "saved";
     renderChips();
     markAssigned();
   } catch (error) {
     saveState.textContent = "not saved";
     toast(error.message, true);
+  }
+}
+
+/* ------------------------------------------------------- markdown editor */
+
+function openMarkdownEditor() {
+  mdPanel.hidden = false;
+  document.getElementById("mdToggleBtn").setAttribute("aria-expanded", "true");
+  // Opening always shows what is saved, never half-typed text.
+  mdSource.value = page.markdown;
+  mdDirty = false;
+  updateManualNote();
+  mdSource.focus();
+}
+
+function closeMarkdownEditor() {
+  if (mdDirty && !confirm("Close without saving? Your markdown edits will be lost.")) return;
+  mdPanel.hidden = true;
+  mdDirty = false;
+  document.getElementById("mdToggleBtn").setAttribute("aria-expanded", "false");
+  showMarkdown(page.preview);
+}
+
+async function saveMarkdown() {
+  const text = mdSource.value;
+  if (!text.trim()) { toast("A page cannot be empty — use Revert instead", true); return; }
+  saveState.textContent = "saving…";
+  try {
+    const result = await api(
+      `/api/tasks/${TASK_ID}/pages/${PAGE_INDEX}/markdown`,
+      jsonRequest("PUT", { markdown: text })
+    );
+    mdDirty = false;
+    applyPageState(result);
+    mdSource.value = page.markdown;
+    saveState.textContent = "saved";
+    toast("Markdown saved");
+  } catch (error) {
+    saveState.textContent = "not saved";
+    toast(error.message, true);
+  }
+}
+
+async function resetMarkdown() {
+  if (mdDirty && !confirm("Throw away your edits and go back to the generated markdown?")) return;
+  saveState.textContent = "saving…";
+  try {
+    const result = await api(
+      `/api/tasks/${TASK_ID}/pages/${PAGE_INDEX}/markdown`,
+      jsonRequest("PUT", { reset: true })
+    );
+    mdDirty = false;
+    applyPageState(result);
+    mdSource.value = page.markdown;
+    saveState.textContent = "saved";
+    toast("Back to the generated markdown");
+  } catch (error) {
+    saveState.textContent = "not saved";
+    toast(error.message, true);
+  }
+}
+
+let mdPreviewTimer = null;
+function previewTypedMarkdown() {
+  mdDirty = true;
+  clearTimeout(mdPreviewTimer);
+  mdPreviewTimer = setTimeout(() => showMarkdown(mdSource.value), 400);
+}
+
+/* --------------------------------------------------------------- re-read */
+
+// Read this page again from its original photo. Progress is on the task page,
+// which is where we go: the editor is only served for a page that has finished
+// reading, so it cannot show the work happening.
+async function rereadPage() {
+  // The figure numbers are kept, so make sure they are saved before the text
+  // they belong to is replaced.
+  try {
+    await saveMapping({ immediate: true });
+  } catch {
+    return;  // saveMapping already reported it
+  }
+
+  const others = ENGINES.filter((name) => name !== DEFAULT_ENGINE);
+  const warning =
+    `\n\nPage ${PAGE_INDEX + 1} is read again from its original photo: its text and ` +
+    `figures are replaced.` +
+    (page.edited || mdDirty ? "\nIts hand-edited markdown is lost." : "") +
+    "\nThe figure numbers you set are kept.";
+
+  let engine;
+  if (others.length === 1) {
+    if (!confirm(`Re-read this page with "${others[0]}"?${warning}`)) return;
+    engine = others[0];
+  } else {
+    const answer = prompt(
+      `Re-read this page with which engine? (${ENGINES.join(", ")})${warning}`,
+      DEFAULT_ENGINE
+    );
+    if (answer === null) return;
+    engine = answer.trim().toLowerCase();
+    if (!ENGINES.includes(engine)) { toast(`"${answer}" is not an engine`, true); return; }
+  }
+
+  const button = document.getElementById("rereadBtn");
+  button.disabled = true;
+  button.textContent = "Queueing…";
+  try {
+    await api(
+      `/api/tasks/${TASK_ID}/pages/${PAGE_INDEX}/reread`,
+      jsonRequest("POST", { engine })
+    );
+    toast(`Page ${PAGE_INDEX + 1} queued for another read`);
+    window.location.href = `/tasks/${TASK_ID}`;
+  } catch (error) {
+    toast(error.message, true);
+    button.disabled = false;
+    button.textContent = "↻ Re-read page";
+  }
+}
+
+/* --------------------------------------------------------------- drawing */
+
+// Outlining a figure the layout model missed. The rectangle is kept in
+// fractions of the photo, so the browser's zoom and window size never change
+// what gets cut; the server turns them into pixels of the original file.
+const cropStage = document.getElementById("cropStage");
+const cropPhoto = document.getElementById("cropPhoto");
+const cropBoxEl = document.getElementById("cropBox");
+const cropInfoEl = document.getElementById("cropInfo");
+const cropAddBtn = document.getElementById("cropAddBtn");
+const cropClearBtn = document.getElementById("cropClearBtn");
+const cropQuestionEl = document.getElementById("cropQuestion");
+
+let drawnBox = null;   // {x, y, w, h} as fractions of the photo
+let dragging = null;    // where the drag started, in the same fractions
+
+function fractionAt(event) {
+  const rect = cropPhoto.getBoundingClientRect();
+  return {
+    x: clamp((event.clientX - rect.left) / rect.width),
+    y: clamp((event.clientY - rect.top) / rect.height),
+  };
+}
+
+function clamp(value) {
+  return Math.max(0, Math.min(1, value));
+}
+
+// The rectangle between two points. Shift makes it a square, which is usually
+// what you want for a diagram and never distorts it.
+function boxBetween(anchor, point, square) {
+  let x = Math.min(anchor.x, point.x);
+  let y = Math.min(anchor.y, point.y);
+  let w = Math.abs(point.x - anchor.x);
+  let h = Math.abs(point.y - anchor.y);
+  if (square) {
+    const side = Math.max(w, h);
+    const x2 = anchor.x + Math.sign(point.x - anchor.x) * side;
+    const y2 = anchor.y + Math.sign(point.y - anchor.y) * side;
+    x = Math.min(anchor.x, x2);
+    y = Math.min(anchor.y, y2);
+    w = side;
+    h = side;
+  }
+  return { x, y, w, h };
+}
+
+function paintBox() {
+  if (!drawnBox) {
+    cropBoxEl.hidden = true;
+    cropAddBtn.disabled = true;
+    cropClearBtn.disabled = true;
+    return;
+  }
+  const box = drawnBox;
+  cropBoxEl.hidden = false;
+  cropBoxEl.style.left = `${box.x * 100}%`;
+  cropBoxEl.style.top = `${box.y * 100}%`;
+  cropBoxEl.style.width = `${box.w * 100}%`;
+  cropBoxEl.style.height = `${box.h * 100}%`;
+
+  // Say what that means in real pixels — the original photo is what gets cut.
+  const width = cropPhoto.naturalWidth || 0;
+  const height = cropPhoto.naturalHeight || 0;
+  if (width && height) {
+    // The cut is from the original photo, but the figure is *shown* at the size
+    // of the rectangle, so say both: what is cut, and what it will look like.
+    const shown = PAGE_WIDTH
+      ? `<br>Shown in the paper at <b>${Math.round(box.w * PAGE_WIDTH)} × ${
+          Math.round((box.h * PAGE_WIDTH * height) / width)
+        } px</b> — ${
+          box.w >= 0.98
+            ? "the whole page width."
+            : `${Math.round(box.w * 100)}% of the page width.`
+        }`
+      : "";
+    cropInfoEl.innerHTML =
+      `Box: <b>${Math.round(box.w * width)} × ${Math.round(box.h * height)} px</b> ` +
+      `of a ${width} × ${height} px photo.${shown} Press <b>Add figure</b>, or drag again ` +
+      `to replace it.`;
+    // Below a dozen pixels it is a speck, not a figure; the server says so too.
+    cropAddBtn.disabled = box.w * width < MIN_CROP_PX || box.h * height < MIN_CROP_PX;
+  }
+  cropClearBtn.disabled = false;
+}
+
+function clearBox() {
+  drawnBox = null;
+  dragAnchor = null;
+  paintBox();
+  cropInfoEl.innerHTML =
+    "Drag across the photo to draw a rectangle, then press <b>Add figure</b>. " +
+    "Hold <kbd>Shift</kbd> for a square.";
+}
+
+cropStage.addEventListener("pointerdown", (event) => {
+  if (event.button !== 0) return;
+  event.preventDefault();
+  cropStage.setPointerCapture(event.pointerId);
+  dragAnchor = fractionAt(event);
+  drawnBox = { x: dragAnchor.x, y: dragAnchor.y, w: 0, h: 0 };
+  paintBox();
+});
+
+cropStage.addEventListener("pointermove", (event) => {
+  if (!dragAnchor) return;
+  drawnBox = boxBetween(dragAnchor, fractionAt(event), event.shiftKey);
+  paintBox();
+});
+
+cropStage.addEventListener("pointerup", (event) => {
+  if (!dragAnchor) return;
+  cropStage.releasePointerCapture(event.pointerId);
+  drawnBox = boxBetween(dragAnchor, fractionAt(event), event.shiftKey);
+  dragAnchor = null;
+  // A click, not a drag: forget it rather than adding a speck.
+  if (drawnBox.w < 0.005 || drawnBox.h < 0.005) clearBox();
+  else paintBox();
+});
+
+cropStage.addEventListener("pointercancel", clearBox);
+cropClearBtn.addEventListener("click", clearBox);
+
+async function addCroppedFigure() {
+  if (!drawnBox) return;
+  cropAddBtn.disabled = true;
+  cropAddBtn.textContent = "Cutting…";
+  try {
+    const question = cropQuestionEl.value.trim();
+    await api(
+      `/api/tasks/${TASK_ID}/pages/${PAGE_INDEX}/crop`,
+      jsonRequest("POST", { ...drawnBox, question })
+    );
+    clearBox();
+    cropQuestionEl.value = "";
+    await refreshPage();
+    saveState.textContent = "saved";
+    toast(
+      question
+        ? `Figure cut out and placed under question ${question}`
+        : "Figure cut out — give it a question number to place it under one"
+    );
+  } catch (error) {
+    toast(error.message, true);
+  } finally {
+    cropAddBtn.textContent = "Add figure";
+    paintBox();
+  }
+}
+
+cropAddBtn.addEventListener("click", addCroppedFigure);
+
+document.getElementById("cropToggleBtn").addEventListener("click", (event) => {
+  const panel = document.getElementById("cropPanel");
+  panel.hidden = !panel.hidden;
+  event.currentTarget.setAttribute("aria-expanded", String(!panel.hidden));
+  if (!panel.hidden && !cropPhoto.complete) {
+    // The pixel readout needs the photo's real size.
+    cropPhoto.addEventListener("load", paintBox, { once: true });
+  }
+});
+
+/* -------------------------------------------------------------- one line */
+
+async function putFiguresOnOneLine() {
+  const figures = rowPick.slice();
+  if (figures.length < 2) { toast("Mark at least two figures with ⤢", true); return; }
+  rowBtn.disabled = true;
+  const original = rowBtn.textContent;
+  rowBtn.textContent = "Laying them out…";
+  try {
+    const result = await api(
+      `/api/tasks/${TASK_ID}/pages/${PAGE_INDEX}/figure-row`,
+      jsonRequest("POST", { figures })
+    );
+    rowPick = [];
+    mdDirty = false;
+    applyPageState(result);
+    if (mdPanel.hidden === false) mdSource.value = page.markdown;
+    saveState.textContent = "saved";
+    toast(`${figures.length} figures now share one line`);
+  } catch (error) {
+    toast(error.message, true);
+  } finally {
+    rowBtn.textContent = original;
+    markRowFigures();
   }
 }
 
@@ -311,9 +862,37 @@ async function loadPage() {
   const data = await api(`/api/tasks/${TASK_ID}/pages/${PAGE_INDEX}`);
   figureNames = data.figures || [];
   detectedQuestions = data.questions || [];
-  showMarkdown(data.labelled_markdown || data.markdown || "");
+  rowPick = [];
+  cropNames = data.crops || [];
+  applyPageState({
+    markdown: data.labelled_markdown || data.markdown || "",
+    preview: data.preview || data.labelled_markdown || "",
+    generated_markdown: data.generated_markdown || "",
+    edited: data.edited,
+    row_figures: data.row_figures || [],
+  });
+  mdSource.value = page.markdown;
+  renderStaleNote(data.stale_mapping || []);
   renderFigures(figureNames, data.mapping || {});
   renderChips();
+}
+
+// Re-fetch and re-render everything. Used after anything that can add or remove
+// a figure, so the cards, the preview and the counters never drift apart.
+async function refreshPage() {
+  const data = await api(`/api/tasks/${TASK_ID}/pages/${PAGE_INDEX}`);
+  figureNames = data.figures || [];
+  cropNames = data.crops || [];
+  applyPageState({
+    markdown: data.labelled_markdown || data.markdown || "",
+    preview: data.preview || data.labelled_markdown || "",
+    generated_markdown: data.generated_markdown || "",
+    edited: data.edited,
+    row_figures: data.row_figures || [],
+  });
+  if (mdPanel.hidden === false && !mdDirty) mdSource.value = page.markdown;
+  renderStaleNote(data.stale_mapping || []);
+  renderFigures(figureNames, data.mapping || {});
 }
 
 document.getElementById("pageSelect").addEventListener("change", (event) => {
@@ -323,6 +902,24 @@ document.getElementById("pageSelect").addEventListener("change", (event) => {
 document.getElementById("autoNextBtn").addEventListener("click", autoFillSequential);
 document.getElementById("autoMatchBtn").addEventListener("click", autoFillMatchDetected);
 document.getElementById("clearBtn").addEventListener("click", () => setMapping(new Map()));
+document.getElementById("rereadBtn").addEventListener("click", rereadPage);
+
+document.getElementById("mdToggleBtn").addEventListener("click", () => {
+  if (mdPanel.hidden) openMarkdownEditor();
+  else closeMarkdownEditor();
+});
+document.getElementById("mdSaveBtn").addEventListener("click", saveMarkdown);
+document.getElementById("mdResetBtn").addEventListener("click", resetMarkdown);
+mdSource.addEventListener("input", previewTypedMarkdown);
+rowBtn.addEventListener("click", putFiguresOnOneLine);
+
+// Ctrl/Cmd+S saves the markdown instead of the browser's page dialog.
+mdSource.addEventListener("keydown", (event) => {
+  if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "s") {
+    event.preventDefault();
+    saveMarkdown();
+  }
+});
 
 document.getElementById("hostBtn").addEventListener("click", async (event) => {
   const button = event.currentTarget;
@@ -500,7 +1097,7 @@ loadPage().catch((error) => toast(error.message, true));
 
 // Warn before losing unsaved edits.
 window.addEventListener("beforeunload", (event) => {
-  if (saveState.textContent === "saving…") {
+  if (mdDirty || saveState.textContent === "saving…") {
     event.preventDefault();
     event.returnValue = "";
   }

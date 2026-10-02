@@ -23,10 +23,17 @@ from fastapi.templating import Jinja2Templates
 
 from . import config, deepseek, image_host, pdf, store
 from .markdown_utils import (
+    ROW_MAX_HEIGHT_PX,
     detect_questions,
     extract_filenames,
+    figures_in_rows,
+    normalize_markdown,
+    normalize_question,
     page_markdown,
+    stale_mapping_names,
     strip_labels,
+    strip_figure,
+    wrap_figures_in_row,
 )
 from .worker import auto_polish_pending, polish_runner, worker
 
@@ -135,6 +142,8 @@ def _page_status_payload(page: dict) -> dict:
         "status": page["status"],
         "error": page["error"],
         "image_count": page["image_count"],
+        # Which engine this page is read with, pinned or configured.
+        "engine": store.page_engine(page),
     }
 
 
@@ -279,6 +288,8 @@ async def page_task(request: Request, task_id: str):
             "deepseek_model": config.DEEPSEEK_MODEL,
             "polish_info": polish_info,
             "pdf_ready": pdf.is_available(),
+            "ocr_engine": config.OCR_ENGINE,
+            "ocr_engines": list(config.OCR_ENGINES),
             "all_pages_done": bool(task["pages"]) and all(p["status"] == store.DONE for p in task["pages"]),
         },
     )
@@ -304,7 +315,11 @@ async def page_edit(request: Request, task_id: str, page: int = 0):
             "task": task,
             "page_index": page,
             "page_count": len(task["pages"]),
+            "page_engine": store.page_engine(current),
             "image_host": config.IMAGE_HOST,
+            "ocr_engines": list(config.OCR_ENGINES),
+            "extract_figures": config.OCR_EXTRACT_FIGURES,
+            "figure_page_width": config.FIGURE_PAGE_WIDTH,
             "deepseek_ready": config.deepseek_ready(),
             "deepseek_model": config.DEEPSEEK_MODEL,
             "polish_info": polish_info,
@@ -421,21 +436,75 @@ async def api_upload_pages(task_id: str, files: list[UploadFile] = File(...)):
     )
 
 
-@app.post("/api/tasks/{task_id}/pages/{page_index}/retry")
-async def api_retry_page(task_id: str, page_index: int):
+def _queue_reread(task_id: str, page_index: int, *, engine: str | None = None) -> dict:
+    """Put a page back on the queue to be read again from its original photo.
+
+    Everything the page is *about* survives — the photo, its filename, the
+    figure numbers you set — while the text produced by the last read is
+    replaced when the new one lands. A page's hand-edited markdown does not
+    survive: it was written against the text this run throws away.
+
+    Raises:
+        HTTPException: the page is already queued or processing (409), or its
+            original photo is gone (400).
+    """
     page = _page_or_404(task_id, page_index)
-    if page["status"] != store.FAILED:
-        raise HTTPException(409, f"Page {page_index + 1} is {page['status']}, not failed")
+    if page["status"] in (store.QUEUED, store.PROCESSING):
+        raise HTTPException(409, f"Page {page_index + 1} is already {page['status']}")
 
     image_path = config.page_image_path(task_id, page_index)
     if not image_path.exists():
         raise HTTPException(400, "The original page image is gone — upload it again")
 
+    if engine is not None:
+        store.set_page_engine(task_id, page_index, engine)
+
     store.reset_page_to_queued(task_id, page_index)
     worker.submit(task_id, page_index, image_path)
     store.rebuild_task(task_id)
-    store.clear_polished_markdown(task_id)
-    return {"page_index": page_index, "status": store.QUEUED}
+    store.clear_polished_markdown(task_id)  # the cleaned paper is now stale
+    return {
+        "page_index": page_index,
+        "status": store.QUEUED,
+        "engine": store.page_engine(store.get_page(task_id, page_index) or {}),
+    }
+
+
+@app.post("/api/tasks/{task_id}/pages/{page_index}/retry")
+async def api_retry_page(task_id: str, page_index: int):
+    """Re-run a page that failed."""
+    page = _page_or_404(task_id, page_index)
+    if page["status"] != store.FAILED:
+        raise HTTPException(409, f"Page {page_index + 1} is {page['status']}, not failed")
+    return _queue_reread(task_id, page_index)
+
+
+@app.post("/api/tasks/{task_id}/pages/{page_index}/reread")
+async def api_reread_page(
+    task_id: str, page_index: int, payload: dict | None = Body(default=None)
+):
+    """Read one page again — the fix for a page the engine got wrong.
+
+    Unlike ``retry`` this also works on a page that read successfully, so a bad
+    transcription, a missed figure or a mangled formula can be thrown away and
+    done again without touching the rest of the paper. The body may carry
+    ``{"engine": "paddle"}`` to read this page with the other engine, which is
+    usually the point: DeepSeek reads at temperature 0, so the same engine twice
+    tends to give the same answer.
+
+    The figure numbers you set are kept. If the new read crops its figures at
+    different coordinates their filenames change, and those numbers stop matching
+    — the review screen reports which ones.
+    """
+    raw = payload if isinstance(payload, dict) else {}
+    engine = raw.get("engine")
+    engine = str(engine).strip().lower() if engine else None
+    if engine is not None and engine not in config.OCR_ENGINES:
+        raise HTTPException(
+            400,
+            f"Unknown engine {engine!r} — use one of {', '.join(sorted(config.OCR_ENGINES))}",
+        )
+    return _queue_reread(task_id, page_index, engine=engine)
 
 
 # --------------------------------------------------------------------------
@@ -491,16 +560,60 @@ async def api_page(task_id: str, page_index: int):
     page = _page_or_404(task_id, page_index)
     markdown = page["markdown"] or ""
     mapping = _mapping_of(page)
+    edited = (page.get("edited_markdown") or "").strip()
+    # What the page would be from the OCR output plus the mapping — always
+    # available, and what "revert" goes back to.
+    generated = store.page_generated_markdown(page)
+    # What the page actually is: the hand-edited text when there is one, plus
+    # any figure the user outlined on the photo.
+    effective = store.page_plain_markdown(page)
+    preview = store.page_render_markdown(page)
+    crops = store.page_crops(page)
+    figures = extract_filenames(effective)
     return {
         "page_index": page_index,
         "status": page["status"],
         "error": page["error"],
         "markdown": markdown,
-        "labelled_markdown": page_markdown(markdown, page["label_mapping"]),
+        # The text as it would be stored, and the same text as the paper shows
+        # it — the difference is the figure display sizes.
+        "labelled_markdown": effective,
+        "preview": preview,
+        "generated_markdown": generated,
+        "edited": bool(edited),
+        "edited_markdown": edited,
         "mapping": mapping,
-        "figures": extract_filenames(markdown),
-        "questions": detect_questions(strip_labels(markdown)),
+        "figures": figures,
+        # Figures outlined by hand, which are removed rather than dropped.
+        "crops": [crop["name"] for crop in crops],
+        "row_figures": figures_in_rows(effective),
+        # Figure numbers left pointing at figures this page no longer has.
+        "stale_mapping": stale_mapping_names(mapping, figures),
+        "engine": store.page_engine(page),
+        "questions": detect_questions(strip_labels(effective)),
         "image_count": page["image_count"],
+    }
+
+
+def _page_markdown_payload(page: dict) -> dict:
+    """The versions of a page's markdown, as the editor needs them.
+
+    ``markdown`` is the text — what the editor shows and what saving stores.
+    ``preview`` is the same text with the figure display sizes applied, which is
+    what the paper and every download use.
+    """
+    generated = store.page_generated_markdown(page)
+    edited = (page.get("edited_markdown") or "").strip()
+    effective = store.page_plain_markdown(page)
+    preview = store.page_render_markdown(page)
+    return {
+        "page_index": page["page_index"],
+        "markdown": effective,
+        "preview": preview,
+        "generated_markdown": generated,
+        "edited": bool(edited),
+        "edited_markdown": edited,
+        "row_figures": figures_in_rows(preview),
     }
 
 
@@ -522,8 +635,241 @@ async def api_save_mapping(
     return {
         "page_index": page_index,
         "mapping": mapping,
-        "markdown": page_markdown(page["markdown"] or "", json.dumps(mapping)),
+        # A hand-edited page is its own markdown, so the mapping only shows up
+        # here once the page has been reverted to the generated version.
+        **_page_markdown_payload(_page_or_404(task_id, page_index)),
     }
+
+
+@app.put("/api/tasks/{task_id}/pages/{page_index}/markdown")
+async def api_save_markdown(
+    task_id: str, page_index: int, payload: dict | None = Body(default=None)
+):
+    """Save the hand-edited markdown of a page, or revert to the generated one.
+
+    The body is ``{"markdown": "…"}`` to save, ``{"reset": true}`` to go back to
+    what the OCR output plus the figure mapping produce. Empty text is treated
+    as a revert rather than as an empty page.
+    """
+    page = _page_or_404(task_id, page_index)
+    _task_or_404(task_id)
+
+    raw = payload if isinstance(payload, dict) else {}
+    text = raw.get("markdown")
+    reset = bool(raw.get("reset")) or not isinstance(text, str) or not text.strip()
+
+    # Normalise on the way in, exactly as OCR text is, so `<img/>`, a stray
+    # `</img>` and `imgs/x.jpg` all end up as the rest of the pipeline expects.
+    store.set_page_markdown(task_id, page_index, None if reset else normalize_markdown(text))
+    store.rebuild_task(task_id)
+    store.clear_polished_markdown(task_id)  # the cleaned paper is now stale
+
+    return _page_markdown_payload(_page_or_404(task_id, page_index))
+
+
+@app.post("/api/tasks/{task_id}/pages/{page_index}/figure-row")
+async def api_figure_row(
+    task_id: str, page_index: int, payload: dict | None = Body(default=None)
+):
+    """Put several figures on one line by moving them into a flexbox row.
+
+    The body is ``{"figures": ["a.jpg", "b.jpg"]}``, optionally with a
+    ``max_height`` in pixels. This edits the page's markdown — the user's own
+    version when there is one, the generated one otherwise — so the row can
+    afterwards be tweaked by hand in the markdown editor.
+    """
+    page = _page_or_404(task_id, page_index)
+    _task_or_404(task_id)
+    if page["status"] != store.DONE:
+        raise HTTPException(400, f"Page {page_index + 1} is not ready yet")
+
+    raw = payload if isinstance(payload, dict) else {}
+    figures = raw.get("figures")
+    if not isinstance(figures, list) or not figures:
+        raise HTTPException(400, "Pick at least two figures to put on one line")
+
+    try:
+        max_height = int(raw.get("max_height") or ROW_MAX_HEIGHT_PX)
+    except (TypeError, ValueError):
+        max_height = ROW_MAX_HEIGHT_PX
+    max_height = max(60, min(800, max_height))
+
+    current = store.page_plain_markdown(page)
+    try:
+        updated = wrap_figures_in_row(current, [str(name) for name in figures], max_height)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    store.set_page_markdown(task_id, page_index, updated)
+    store.rebuild_task(task_id)
+    store.clear_polished_markdown(task_id)  # the cleaned paper is now stale
+
+    return _page_markdown_payload(_page_or_404(task_id, page_index))
+
+
+# --------------------------------------------------------------------------
+# Outlining a figure by hand
+# --------------------------------------------------------------------------
+#
+# The layout model misses things: a small diagram inside a paragraph, a figure
+# with no border, a table it reads as prose. The fix is to draw the box
+# yourself. The rectangle is sent as fractions of the photo, so it means the
+# same thing whatever size the browser showed it at, and the crop is taken from
+# the original file rather than the downscaled copy the model sees — a
+# hand-drawn figure is as sharp as the photo.
+
+CROP_MIN_PIXELS = 12
+
+
+def _normalized_box(payload: dict) -> tuple[float, float, float, float]:
+    """``(x, y, w, h)`` as fractions of the photo, from either form.
+
+    Accepts ``{x, y, w, h}`` or ``{x1, y1, x2, y2}``, because a rectangle drawn
+    on a photo is naturally described both ways.
+    """
+    def number(*keys: str) -> float | None:
+        for key in keys:
+            if key in payload:
+                try:
+                    return float(payload[key])
+                except (TypeError, ValueError):
+                    raise HTTPException(400, f"{key!r} must be a number") from None
+        return None
+
+    if all(key in payload for key in ("x1", "y1", "x2", "y2")):
+        x1, y1 = number("x1"), number("y1")
+        x2, y2 = number("x2"), number("y2")
+        return min(x1, x2), min(y1, y2), abs(x2 - x1), abs(y2 - y1)
+
+    x, y, w, h = number("x"), number("y"), number("w"), number("h")
+    if None in (x, y, w, h):
+        raise HTTPException(
+            400, "Draw a box on the photo first — {x, y, w, h} or {x1, y1, x2, y2}"
+        )
+    return x, y, w, h
+
+
+def _crop_pixels(
+    photo: Path, box: tuple[float, float, float, float]
+) -> tuple[tuple[int, int, int, int], int, int]:
+    """Turn fractions of the photo into a padded pixel rectangle."""
+    x, y, width, height = box
+    if not (0 <= x <= 1 and 0 <= y <= 1 and 0 <= width <= 1 and 0 <= height <= 1):
+        raise HTTPException(400, "The box must lie inside the photo (0 to 1)")
+
+    from PIL import Image
+
+    with Image.open(photo) as image:
+        page_w, page_h = image.size
+
+    x1, y1 = int(x * page_w), int(y * page_h)
+    x2, y2 = int((x + width) * page_w), int((y + height) * page_h)
+    # Judge the box the user drew, not the padded crop: padding would otherwise
+    # turn a stray click into a 12x12 "figure".
+    if x2 - x1 < CROP_MIN_PIXELS or y2 - y1 < CROP_MIN_PIXELS:
+        raise HTTPException(400, "That box is too small to be a figure")
+
+    # A little margin, so the outline of the figure is not cut off.
+    pad = config.LAYOUT_PADDING
+    x1 = max(0, x1 - pad)
+    y1 = max(0, y1 - pad)
+    x2 = min(page_w, x2 + pad)
+    y2 = min(page_h, y2 + pad)
+    return (x1, y1, x2, y2), page_w, page_h
+
+
+@app.post("/api/tasks/{task_id}/pages/{page_index}/crop")
+async def api_manual_crop(
+    task_id: str, page_index: int, payload: dict | None = Body(default=None)
+):
+    """Crop the rectangle the user drew on the page photo and add it as a figure.
+
+    The body is ``{"x": .1, "y": .2, "w": .3, "h": .25}`` — fractions of the
+    photo — plus an optional ``"question": "13"`` to put it under that question,
+    exactly as typing the number on a figure card would.
+    """
+    page = _page_or_404(task_id, page_index)
+    _task_or_404(task_id)
+    if page["status"] != store.DONE:
+        raise HTTPException(400, f"Page {page_index + 1} is not ready yet")
+
+    photo = config.page_image_path(task_id, page_index)
+    if not photo.is_file():
+        raise HTTPException(400, "The page photo is gone — upload it again")
+
+    raw = payload if isinstance(payload, dict) else {}
+    (x1, y1, x2, y2), page_w, page_h = _crop_pixels(photo, _normalized_box(raw))
+
+    from PIL import Image, ImageOps
+
+    images_dir = config.images_dir(task_id)
+    images_dir.mkdir(parents=True, exist_ok=True)
+    # The same box-in-the-name convention the OCR crops use, so figure serving
+    # and the auto-fill sort work on these too.
+    name = f"p{page_index + 1}_manual_box_{x1}_{y1}_{x2}_{y2}.jpg"
+
+    with Image.open(photo) as image:
+        image = ImageOps.exif_transpose(image)
+        if image.mode != "RGB":
+            image = image.convert("RGB")
+        crop = image.crop((x1, y1, x2, y2))
+        crop.save(images_dir / name, format="JPEG", quality=95)
+
+    crops = store.page_crops(page)
+    crops = [crop for crop in crops if crop["name"] != name]
+    crops.append({"name": name, "box": [x1, y1, x2, y2]})
+    store.set_page_crops(task_id, page_index, crops)
+
+    question = normalize_question(raw.get("question") or "")
+    if question:
+        mapping = _mapping_of(page)
+        mapping[name] = question
+        store.set_page_mapping(task_id, page_index, mapping)
+
+    store.rebuild_task(task_id)
+    store.clear_polished_markdown(task_id)  # the cleaned paper is now stale
+    log(f"[{task_id}] page {page_index + 1}: outlined {name} at ({x1},{y1})-({x2},{y2})")
+
+    fresh = _page_or_404(task_id, page_index)
+    return {
+        "filename": name,
+        "url": f"/tasks/{task_id}/images/{name}",
+        "box": [x1, y1, x2, y2],
+        "photo_size": [page_w, page_h],
+        "question": question,
+        **_page_markdown_payload(fresh),
+    }
+
+
+@app.delete("/api/tasks/{task_id}/pages/{page_index}/crop/{filename}")
+async def api_delete_crop(task_id: str, page_index: int, filename: str):
+    """Remove a figure the user outlined, and its number."""
+    page = _page_or_404(task_id, page_index)
+    name = Path(filename).name
+    crops = [crop for crop in store.page_crops(page) if crop["name"] != name]
+    if len(crops) == len(store.page_crops(page)):
+        raise HTTPException(404, f"This page has no outlined figure called {name}")
+
+    store.set_page_crops(task_id, page_index, crops)
+
+    mapping = _mapping_of(page)
+    if name in mapping:
+        mapping.pop(name)
+        store.set_page_mapping(task_id, page_index, mapping)
+
+    # The figure may also be inside the page's hand-edited text — put in a
+    # one-line row by hand — so the reference has to go from there too.
+    edited = page.get("edited_markdown") or ""
+    if edited and f"images/{name}" in edited:
+        store.set_page_markdown(task_id, page_index, strip_figure(edited, name))
+
+    store.rebuild_task(task_id)
+    store.clear_polished_markdown(task_id)
+    # Only ever delete a file this feature wrote.
+    if "manual_box_" in name:
+        (config.images_dir(task_id) / name).unlink(missing_ok=True)
+
+    return _page_markdown_payload(_page_or_404(task_id, page_index))
 
 
 # --------------------------------------------------------------------------
@@ -686,7 +1032,7 @@ async def download_page(task_id: str, page_index: int, inline: bool = False):
     if page["status"] != store.DONE:
         raise HTTPException(400, f"Page {page_index + 1} is not ready yet")
 
-    markdown = page_markdown(page["markdown"] or "", page["label_mapping"])
+    markdown = store.page_render_markdown(page)
     markdown, _ = await asyncio.to_thread(image_host.host_markdown, markdown, task_id)
 
     if inline:

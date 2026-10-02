@@ -8,14 +8,23 @@ guarded by a re-entrant lock is simpler (and fast enough) than an async driver.
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import threading
 import time
 import uuid
+from pathlib import Path
 from typing import Any
 
 from . import config
-from .markdown_utils import extract_baked_labels, merge_pages, page_markdown
+from .markdown_utils import (
+    append_crops,
+    extract_baked_labels,
+    merge_pages,
+    page_markdown,
+    style_figures,
+    wrap_bare_latex,
+)
 
 # Page statuses
 QUEUED = "queued"
@@ -47,16 +56,19 @@ CREATE TABLE IF NOT EXISTS tasks (
 );
 
 CREATE TABLE IF NOT EXISTS pages (
-    task_id        TEXT NOT NULL,
-    page_index     INTEGER NOT NULL,
-    filename       TEXT NOT NULL DEFAULT '',
-    status         TEXT NOT NULL DEFAULT 'queued',
-    error          TEXT,
-    markdown       TEXT,
-    label_mapping  TEXT,
-    image_count    INTEGER NOT NULL DEFAULT 0,
-    created_at     REAL NOT NULL,
-    updated_at     REAL NOT NULL,
+    task_id         TEXT NOT NULL,
+    page_index      INTEGER NOT NULL,
+    filename        TEXT NOT NULL DEFAULT '',
+    status          TEXT NOT NULL DEFAULT 'queued',
+    error           TEXT,
+    markdown        TEXT,
+    label_mapping   TEXT,
+    edited_markdown TEXT,
+    manual_crops    TEXT,
+    ocr_engine      TEXT,
+    image_count     INTEGER NOT NULL DEFAULT 0,
+    created_at      REAL NOT NULL,
+    updated_at      REAL NOT NULL,
     PRIMARY KEY (task_id, page_index)
 );
 
@@ -143,6 +155,21 @@ def _migrate(connection: sqlite3.Connection) -> None:
         ),
     ):
         if name not in columns:
+            connection.execute(ddl)
+
+    # The hand-edited markdown of a page: what the markdown editor saved, used
+    # in place of the mapping-derived text until it is reverted.
+    # ``manual_crops`` holds the figures the user outlined on the page photo
+    # because the layout model missed them.
+    # ``ocr_engine`` pins one page to an engine, so it can be re-read with a
+    # second opinion without changing the setting for the whole app.
+    page_columns = {row[1] for row in connection.execute("PRAGMA table_info(pages)")}
+    for name, ddl in (
+        ("edited_markdown", "ALTER TABLE pages ADD COLUMN edited_markdown TEXT"),
+        ("manual_crops", "ALTER TABLE pages ADD COLUMN manual_crops TEXT"),
+        ("ocr_engine", "ALTER TABLE pages ADD COLUMN ocr_engine TEXT"),
+    ):
+        if name not in page_columns:
             connection.execute(ddl)
 
     _migrate_page_labels(connection)
@@ -249,8 +276,8 @@ def add_page(task_id: str, page_index: int, filename: str) -> None:
     _execute(
         "INSERT OR REPLACE INTO pages "
         "(task_id, page_index, filename, status, error, markdown, label_mapping, "
-        " image_count, created_at, updated_at) "
-        "VALUES (?, ?, ?, ?, NULL, NULL, NULL, 0, ?, ?)",
+        " edited_markdown, manual_crops, ocr_engine, image_count, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, 0, ?, ?)",
         (task_id, page_index, filename, QUEUED, now, now),
     )
 
@@ -264,9 +291,14 @@ def mark_page_processing(task_id: str, page_index: int) -> None:
 
 
 def mark_page_done(task_id: str, page_index: int, markdown: str, image_count: int) -> None:
+    """Record a finished read.
+
+    Any hand-edited markdown is dropped: it was written against the previous
+    OCR output, which this call has just replaced wholesale.
+    """
     _execute(
-        "UPDATE pages SET status = ?, markdown = ?, image_count = ?, error = NULL, updated_at = ? "
-        "WHERE task_id = ? AND page_index = ?",
+        "UPDATE pages SET status = ?, markdown = ?, image_count = ?, edited_markdown = NULL, "
+        "error = NULL, updated_at = ? WHERE task_id = ? AND page_index = ?",
         (DONE, markdown, image_count, time.time(), task_id, page_index),
     )
 
@@ -284,6 +316,216 @@ def set_page_mapping(task_id: str, page_index: int, mapping: dict[str, str]) -> 
         "UPDATE pages SET label_mapping = ?, updated_at = ? "
         "WHERE task_id = ? AND page_index = ?",
         (json.dumps(mapping, ensure_ascii=False), time.time(), task_id, page_index),
+    )
+
+
+def set_page_markdown(task_id: str, page_index: int, markdown: str | None) -> None:
+    """Save the hand-edited markdown of a page; ``None`` reverts to generated."""
+    _execute(
+        "UPDATE pages SET edited_markdown = ?, updated_at = ? "
+        "WHERE task_id = ? AND page_index = ?",
+        (markdown, time.time(), task_id, page_index),
+    )
+
+
+def set_page_engine(task_id: str, page_index: int, engine: str | None) -> None:
+    """Pin a page to one OCR engine; ``None`` goes back to the configured one."""
+    _execute(
+        "UPDATE pages SET ocr_engine = ?, updated_at = ? "
+        "WHERE task_id = ? AND page_index = ?",
+        (engine, time.time(), task_id, page_index),
+    )
+
+
+def page_engine(page: dict[str, Any]) -> str:
+    """The engine a page is read with: its own pin, else the configured one."""
+    pinned = (page.get("ocr_engine") or "").strip()
+    return pinned or config.OCR_ENGINE
+
+
+def page_crops(page: dict[str, Any]) -> list[dict[str, Any]]:
+    """The figures the user outlined on this page's photo, in order.
+
+    Each entry is ``{"name": filename, "box": [x1, y1, x2, y2]}`` with the box in
+    pixels of the original photo. Kept apart from the OCR text so that reading
+    the page again cannot throw a hand-drawn figure away.
+    """
+    raw = page.get("manual_crops") or ""
+    try:
+        parsed = json.loads(raw) if raw else []
+    except (json.JSONDecodeError, TypeError):
+        return []
+    if not isinstance(parsed, list):
+        return []
+    return [
+        {"name": str(item.get("name") or ""), "box": item.get("box")}
+        for item in parsed
+        if isinstance(item, dict) and item.get("name")
+    ]
+
+
+def set_page_crops(task_id: str, page_index: int, crops: list[dict[str, Any]]) -> None:
+    _execute(
+        "UPDATE pages SET manual_crops = ?, updated_at = ? "
+        "WHERE task_id = ? AND page_index = ?",
+        (json.dumps(crops, ensure_ascii=False), time.time(), task_id, page_index),
+    )
+
+
+# Image sizes, by file and mtime: reading the header is cheap, but a rebuild
+# re-renders every page on every keystroke in the figure mapping, so it is worth
+# remembering. Keyed on the stat so a re-crop is never served a stale size.
+_image_size_cache: dict[tuple[str, int, int], tuple[int, int] | None] = {}
+
+
+def _image_size(path: Path) -> tuple[int, int] | None:
+    try:
+        info = path.stat()
+    except OSError:
+        return None
+    key = (str(path), info.st_mtime_ns, info.st_size)
+    if key not in _image_size_cache:
+        if len(_image_size_cache) > 4096:
+            _image_size_cache.clear()
+        size = None
+        try:
+            from PIL import Image
+
+            with Image.open(path) as image:
+                size = (int(image.size[0]), int(image.size[1]))
+        except Exception:  # noqa: BLE001 - an unreadable file just gets no size
+            size = None
+        _image_size_cache[key] = size
+    return _image_size_cache[key]
+
+
+_BOX_IN_NAME_RE = re.compile(r"_box_(\d+)_(\d+)_(\d+)_(\d+)\.")
+
+
+def box_from_name(name: str) -> list[int] | None:
+    """The rectangle an engine cropped, read back out of the figure's name.
+
+    Both engines name a crop after the box it came from —
+    ``p2_img_in_image_box_475_2365_1335_2938.jpg`` — so the figure's own name
+    says how much of the page it covered, which is what it should be shown at.
+    """
+    match = _BOX_IN_NAME_RE.search(name)
+    if not match:
+        return None
+    return [int(value) for value in match.groups()]
+
+
+def figure_sizer(task_id: str, page_index: int, boxes: dict[str, list]):
+    """A ``size_for(ref) -> (width, height)`` for one page's figures.
+
+    The size a figure should *be* is the size of the rectangle that made it: a
+    diagram drawn across a third of the page is a third of the page wide in the
+    paper. So the rectangle is measured against the page, and the full width of
+    the page counts as ``FIGURE_PAGE_WIDTH`` pixels.
+
+    The two kinds of rectangle are in different coordinate spaces, which does
+    not matter because only the *share* of the page matters: a figure the user
+    outlined carries its box in page-photo pixels, while an engine crop carries
+    its box in the pixels of the downscaled copy the model saw. Dividing by the
+    width of the image that box was measured in gives the same fraction either
+    way.
+
+    The figures' own files are the fallback for anything with no box at all, so
+    nothing is ever enlarged to fill the space.
+    """
+    page_size = _image_size(config.page_image_path(task_id, page_index))
+    page_width = config.FIGURE_PAGE_WIDTH
+    prepared_width = _prepared_width(page_size)
+
+    def size_for(ref: str) -> tuple[int | None, int | None]:
+        name = Path(ref.split("?", 1)[0]).name
+        if not name:
+            return None, None
+
+        box = boxes.get(name)
+        if box and len(box) == 4 and page_size:
+            return _size_of_box(box, page_size[0], page_width)
+        if page_size and prepared_width:
+            engine_box = box_from_name(name)
+            if engine_box:
+                return _size_of_box(engine_box, prepared_width, page_width)
+
+        natural = _image_size(config.images_dir(task_id) / name)
+        return (natural[0], natural[1]) if natural else (None, None)
+
+    return size_for
+
+
+def _prepared_width(page_size: tuple[int, int] | None) -> int:
+    """The width of the downscaled copy the model reads, from the page size.
+
+    ``ocr.prepare_input`` only ever shrinks the long edge to ``OCR_MAX_DIM``, so
+    the width of the copy is derivable without keeping the file around.
+    """
+    if not page_size or not page_size[0]:
+        return 0
+    limit = config.OCR_MAX_DIM
+    longest = max(page_size)
+    if not limit or longest <= limit:
+        return page_size[0]
+    return max(1, round(page_size[0] * limit / longest))
+
+
+def _size_of_box(box: list[int], page_width: int, target_width: int):
+    """The width and height a rectangle of the page should be shown at."""
+    if not page_width or len(box) != 4:
+        return None, None
+    x1, y1, x2, y2 = box
+    width = round(max(0, x2 - x1) / page_width * target_width)
+    # The height the same rectangle would have on a page that many pixels wide,
+    # so a figure can never come out taller than it was on the page.
+    height = round(max(0, y2 - y1) / page_width * target_width)
+    return width or None, height or None
+
+
+def page_generated_markdown(page: dict[str, Any]) -> str:
+    """What the page would be without a hand edit — exactly what revert restores.
+
+    Unstyled on purpose: this is the text, and it is what the markdown editor
+    shows when you press **Revert to generated**.
+    """
+    return page_markdown(page["markdown"] or "", page["label_mapping"])
+
+
+def page_plain_markdown(page: dict[str, Any]) -> str:
+    """The page's text as it would be stored: no display sizes.
+
+    Hand-outlined figures are appended *before* the mapping runs, so a crop with
+    a question number is placed like any other figure. A hand-edited page keeps
+    its own text, so they are appended to that instead — also unsized, because
+    hand-edited text is used exactly as saved.
+    """
+    raw = page["markdown"] or ""
+    crops = page_crops(page)
+    edited = page.get("edited_markdown") or ""
+    names = [crop["name"] for crop in crops]
+
+    if edited.strip():
+        return append_crops(page_markdown(raw, page["label_mapping"], edited), names)
+    return page_markdown(append_crops(raw, names), page["label_mapping"], edited)
+
+
+def page_render_markdown(page: dict[str, Any]) -> str:
+    """What the paper shows: the text with the figure display sizes applied.
+
+    Presentation, decided here rather than baked into what is stored — so
+    changing ``FIGURE_PAGE_WIDTH`` changes every page, including the hand-edited
+    ones, and the text itself is never rewritten.
+    """
+    if not config.FIGURE_PAGE_WIDTH:
+        return page_plain_markdown(page)  # sizing switched off
+
+    boxes = {crop["name"]: crop.get("box") or [] for crop in page_crops(page)}
+    return style_figures(
+        wrap_bare_latex(page_plain_markdown(page)),
+        config.FIGURE_MAX_WIDTH,
+        config.FIGURE_MAX_HEIGHT,
+        size_for=figure_sizer(page.get("task_id") or "", page["page_index"], boxes),
     )
 
 
@@ -324,7 +566,7 @@ def rebuild_task(task_id: str) -> dict[str, Any] | None:
     page_texts: list[str] = []
     for page in pages:
         if page["status"] == DONE:
-            page_texts.append(page_markdown(page["markdown"] or "", page["label_mapping"]))
+            page_texts.append(page_render_markdown(page))
         elif page["status"] == FAILED:
             page_texts.append(
                 f"<!-- page {page['page_index'] + 1} FAILED: {page['error'] or 'unknown error'} -->"

@@ -115,9 +115,22 @@ class OcrWorker:
         ocr.log(f"{label} started")
 
         try:
-            markdown, figures, suggested = ocr.run_ocr(
-                job.image_path, work_dir, images_dir, prefix
-            )
+            page = store.get_page(job.task_id, job.page_index) or {}
+            # A page re-read with a different engine keeps that pin, so the
+            # choice survives a restart and applies to any later re-read.
+            engine = (page.get("ocr_engine") or "").strip()
+
+            if engine:
+                markdown, figures, suggested = ocr.run_ocr(
+                    job.image_path, work_dir, images_dir, prefix, engine=engine
+                )
+            else:
+                # The plain call keeps the usual four-argument contract, which
+                # anything stubbing the OCR still honours.
+                markdown, figures, suggested = ocr.run_ocr(
+                    job.image_path, work_dir, images_dir, prefix
+                )
+
             # An engine may work out which question each figure belongs to.
             # Store it as the page's mapping — never baked into the text — so the
             # renderer applies it and the user can adjust it in the review screen.
@@ -127,7 +140,9 @@ class OcrWorker:
                     store.set_page_mapping(job.task_id, job.page_index, suggested)
                     ocr.log(f"{label} matched {len(suggested)} figure(s) to questions")
             store.mark_page_done(job.task_id, job.page_index, markdown, len(figures))
-            ocr.log(f"{label} done ({len(figures)} figure(s))")
+            ocr.log(
+                f"{label} done ({len(figures)} figure(s), engine {engine or config.OCR_ENGINE})"
+            )
         except Exception as exc:  # noqa: BLE001 - recorded and shown in the UI
             if config.OCR_DEBUG:
                 ocr.log(traceback.format_exc())

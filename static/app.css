@@ -235,6 +235,108 @@ tbody tr:hover { background: #fafbfc; }
   letter-spacing: .02em;
 }
 
+/* One-line figure rows: the row is a flex div in the markdown itself, so the
+   preview only needs to let it breathe. */
+.preview div[style*="flex"] img,
+.preview div[style*="grid"] img { max-width: 100%; }
+
+/* ---------- markdown editor ---------- */
+
+.md-panel { padding: 12px 14px 14px; }
+.md-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+  font-size: 13px;
+}
+.md-source {
+  width: 100%;
+  min-height: 340px;
+  resize: vertical;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12.5px;
+  line-height: 1.6;
+  tab-size: 2;
+  white-space: pre;
+  overflow-wrap: normal;
+  overflow-x: auto;
+}
+.md-source:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: -1px;
+  border-color: var(--accent);
+}
+
+.figures-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-top: 10px;
+  font-size: 12px;
+}
+.hint.warn-line {
+  background: var(--warn-soft);
+  color: var(--warn);
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+
+/* ---------- outlining a figure by hand ---------- */
+
+.crop-panel { padding: 12px 14px 14px; }
+.crop-q {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.crop-q input { width: 64px; padding: 6px 8px; }
+/* Drawing happens on the photo itself, so it must not scroll the page or
+   select text halfway through a drag. */
+.crop-stage {
+  position: relative;
+  line-height: 0;
+  user-select: none;
+  -webkit-user-select: none;
+  touch-action: none;
+  cursor: crosshair;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.crop-stage img { width: 100%; height: auto; display: block; }
+.crop-box {
+  position: absolute;
+  border: 2px dashed var(--accent);
+  background: rgba(37, 99, 235, .16);
+  box-shadow: 0 0 0 9999px rgba(20, 24, 33, .18);
+  pointer-events: none;
+}
+
+/* A figure the user outlined rather than the OCR finding. */
+.figure.hand { border-color: #b9e3c4; }
+.figure .handbadge {
+  margin-left: 6px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--ok-soft);
+  color: var(--ok);
+  font-size: 10px;
+  letter-spacing: .03em;
+  text-transform: uppercase;
+}
+
+/* ---------- re-read controls (task page, per page card) ---------- */
+
+.reread { display: inline-flex; align-items: center; gap: 6px; }
+.reread select { padding: 6px 8px; font-size: 12px; }
+.reread button { padding: 6px 10px; font-size: 13px; }
+.card .reread { margin-left: auto; }
+
 .figures { display: grid; grid-template-columns: 1fr; gap: 12px; }
 .figure {
   border: 1px solid var(--line);
@@ -252,6 +354,16 @@ tbody tr:hover { background: #fafbfc; }
 .figure input { width: 68px; }
 .figure .seq { font-size: 11px; color: var(--muted); }
 .figure.assigned { border-color: #bcd0f7; background: #fbfdff; }
+
+/* Marked for the next one-line row. */
+.figure.picked { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-soft); }
+.figure [data-role="row"] { padding: 5px 9px; line-height: 1; color: var(--muted); }
+.figure [data-role="row"].on { background: var(--accent); border-color: var(--accent); color: #fff; }
+/* Already sitting in a row of the markdown. */
+.figure.in-row { background: #f6fbf6; }
+.figure.in-row.picked { background: #fbfdff; }
+.figure .rowmark { font-size: 11px; color: var(--ok); }
+.figure .rowmark.on { color: var(--accent); font-weight: 600; }
 
 /* Marked for deletion — kept visible and greyed so it can be undone. */
 .figure.dropped {
